@@ -40,3 +40,26 @@ keyword_store = ElasticsearchKeywordStore(
 Every online retrieval call should pass a `RetrievalScope`. Even single-tenant
 deployments should use a stable tenant id such as `default` so future
 multi-tenant migrations do not require changing the retrieval API.
+
+## Agent Runtime
+
+Use `RetrievalMiddleware` to expose the retriever to the main agent:
+
+```python
+from deepagents import create_deep_agent
+from deepagents.middleware.retrieval import RetrievalMiddleware, RuntimeContextDefaults
+
+agent = create_deep_agent(
+    model=model,
+    middleware=[
+        RetrievalMiddleware(
+            rag_retriever=retriever,
+            rag_mode="tool",
+            defaults=RuntimeContextDefaults(tenant_id="default"),
+        )
+    ],
+)
+```
+
+The middleware adds a `search_knowledge_base` tool. If `rag_mode` is `auto` or
+`hybrid`, it also injects a small Top-K context block before model calls.

@@ -17,3 +17,26 @@ Use `MemoryRecord.to_document_chunk()` when indexing memory into the hybrid RAG
 pipeline. Use `MemoryService.build_context()` to inject only relevant Top-K
 memories into a prompt. Use `create_langmem_memory_tools()` when wiring LangMem
 tools into a LangGraph agent.
+
+## Agent Runtime
+
+Use `RetrievalMiddleware` to expose long-term memory to the main agent:
+
+```python
+from deepagents import create_deep_agent
+from deepagents.middleware.retrieval import RetrievalMiddleware, RuntimeContextDefaults
+
+agent = create_deep_agent(
+    model=model,
+    middleware=[
+        RetrievalMiddleware(
+            memory_service=memory_service,
+            memory_mode="hybrid",
+            defaults=RuntimeContextDefaults(tenant_id="default", user_id="user-1"),
+        )
+    ],
+)
+```
+
+`hybrid` mode injects a small Top-K memory block automatically and also exposes
+`search_memory`, `save_memory`, and `delete_memory` tools.
