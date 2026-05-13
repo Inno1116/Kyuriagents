@@ -3,7 +3,7 @@
 This package contains the online retrieval path for a hybrid RAG system:
 query rewriting, keyword/vector retrieval, rank fusion, reranking, and Top-K
 selection. Offline document parsing and embedding jobs should write chunks into
-Milvus, Elasticsearch, and the MySQL metadata tables described in
+Milvus, Elasticsearch, and the PostgreSQL metadata tables described in
 `deepagents/rag/schemas`.
 """
 

@@ -11,7 +11,7 @@ This package contains the online retrieval path for hybrid RAG:
 
 The offline indexing pipeline is intentionally separate. It should parse source
 documents, chunk text, create embeddings, write vectors to Milvus, write keyword
-documents to Elasticsearch, and write authoritative metadata to MySQL.
+documents to Elasticsearch, and write authoritative metadata to PostgreSQL.
 
 Production integrations should implement `VectorSearcher`, `KeywordSearcher`,
 and `Reranker`. The included in-memory stores are for local development and
