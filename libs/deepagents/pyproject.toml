@@ -30,6 +30,10 @@ dependencies = [
 
 [project.optional-dependencies]
 quickjs = ["langchain-quickjs"]
+rag = [
+    "elasticsearch>=8.12.0,<9.0.0",
+    "pymilvus>=2.4.0,<3.0.0",
+]
 
 [project.urls]
 Homepage = "https://docs.langchain.com/oss/python/deepagents/overview"
@@ -67,6 +71,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.package-data]
 "*" = ["py.typed", "*.md"]
+"deepagents.rag" = ["schemas/*.sql", "schemas/*.json", "schemas/*.md", "schemas/*.example"]
 
 [tool.ruff]
 line-length = 150
