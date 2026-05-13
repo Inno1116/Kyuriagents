@@ -9,6 +9,17 @@ from deepagents.memory import MemoryService, PostgresMemoryStore
 from deepagents.middleware.retrieval import RetrievalMiddleware
 from deepagents.rag import ElasticsearchKeywordStore, HybridRAGRetriever, MilvusVectorStore
 from deepagents.runtime.dashscope import EmbedQuery, create_dashscope_embed_query, create_dashscope_model
+from deepagents.runtime.mcp import LoadedMCPTools, load_mcp_tools
+from deepagents.tools import (
+    PostgresToolAuditSink,
+    ToolAuditSink,
+    ToolDescriptor,
+    ToolGovernanceMiddleware,
+    ToolPolicy,
+    ToolRegistry,
+    default_tool_registry,
+    merge_tool_sequences,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -32,6 +43,11 @@ def create_kyuri_agent(
     rag_retriever: HybridRAGRetriever | None = None,
     memory_service: MemoryService | None = None,
     embed_query: EmbedQuery | None = None,
+    tool_registry: ToolRegistry | None = None,
+    tool_policy: ToolPolicy | None = None,
+    tool_audit_sink: ToolAuditSink | None = None,
+    mcp_tools: Sequence[BaseTool | Callable | dict[str, Any]] | LoadedMCPTools | None = None,
+    mcp_descriptors: Sequence[ToolDescriptor] = (),
     checkpointer: Checkpointer | None = None,
     store: BaseStore | None = None,
     system_prompt: str | None = None,
@@ -48,6 +64,12 @@ def create_kyuri_agent(
         rag_retriever: Optional prebuilt RAG retriever.
         memory_service: Optional prebuilt memory service.
         embed_query: Optional query embedding function.
+        tool_registry: Optional registry for tool descriptors.
+        tool_policy: Optional policy for tool calls.
+        tool_audit_sink: Optional audit sink.
+        mcp_tools: Optional preloaded MCP tools. When omitted and MCP is
+            enabled, tools are loaded from `config.mcp_config_path`.
+        mcp_descriptors: Optional descriptors for preloaded MCP tools.
         checkpointer: Optional LangGraph checkpointer.
         store: Optional LangGraph store.
         system_prompt: Optional user system prompt.
@@ -79,12 +101,25 @@ def create_kyuri_agent(
         memory_mode=config.memory_mode,
         defaults=config.retrieval_defaults(),
     )
+    resolved_tools, governance = _build_tool_runtime(
+        config,
+        native_tools=tools,
+        middleware_tools=retrieval.tools,
+        tool_registry=tool_registry,
+        tool_policy=tool_policy,
+        tool_audit_sink=tool_audit_sink,
+        mcp_tools=mcp_tools,
+        mcp_descriptors=mcp_descriptors,
+    )
+    resolved_middleware = [*middleware, retrieval]
+    if governance is not None:
+        resolved_middleware.append(governance)
 
     return create_deep_agent(
         model=resolved_model,
-        tools=tools,
+        tools=resolved_tools,
         system_prompt=system_prompt,
-        middleware=[*middleware, retrieval],
+        middleware=resolved_middleware,
         checkpointer=resolved_checkpointer,
         store=resolved_store,
         debug=debug,
@@ -114,6 +149,61 @@ def _create_memory_service(config: AgentRuntimeConfig) -> MemoryService:
         msg = f"Missing settings for memory runtime: {missing}."
         raise ValueError(msg)
     return MemoryService(PostgresMemoryStore(dsn=config.postgres_dsn))
+
+
+def _build_tool_runtime(
+    config: AgentRuntimeConfig,
+    *,
+    native_tools: Sequence[BaseTool | Callable | dict[str, Any]] | None,
+    middleware_tools: Sequence[BaseTool],
+    tool_registry: ToolRegistry | None,
+    tool_policy: ToolPolicy | None,
+    tool_audit_sink: ToolAuditSink | None,
+    mcp_tools: Sequence[BaseTool | Callable | dict[str, Any]] | LoadedMCPTools | None,
+    mcp_descriptors: Sequence[ToolDescriptor],
+) -> tuple[list[BaseTool | Callable | dict[str, Any]], ToolGovernanceMiddleware | None]:
+    registry = tool_registry.copy() if tool_registry is not None else default_tool_registry()
+    resolved_mcp_tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None
+    resolved_mcp_descriptors: Sequence[ToolDescriptor] = mcp_descriptors
+    if config.enable_mcp:
+        loaded = load_mcp_tools(config) if mcp_tools is None else mcp_tools
+        if isinstance(loaded, LoadedMCPTools):
+            resolved_mcp_tools = loaded.tools
+            resolved_mcp_descriptors = (*resolved_mcp_descriptors, *loaded.descriptors)
+        else:
+            resolved_mcp_tools = loaded
+
+    for tool in native_tools or ():
+        _register_tool_if_missing(registry, tool)
+    for tool in middleware_tools:
+        _register_tool_if_missing(registry, tool, source="runtime")
+    registry.register_many(resolved_mcp_descriptors, replace_existing=True)
+
+    governance = None
+    if config.enable_tools:
+        resolved_audit_sink = tool_audit_sink
+        if resolved_audit_sink is None and config.enable_tool_audit and config.postgres_dsn:
+            resolved_audit_sink = PostgresToolAuditSink(dsn=config.postgres_dsn)
+        governance = ToolGovernanceMiddleware(
+            registry=registry,
+            policy=tool_policy or config.tool_policy(),
+            audit_sink=resolved_audit_sink,
+            defaults=config.tool_defaults(),
+        )
+
+    return merge_tool_sequences(native_tools, resolved_mcp_tools), governance
+
+
+def _register_tool_if_missing(
+    registry: ToolRegistry,
+    tool: BaseTool | Callable | dict[str, Any],
+    *,
+    source: str = "native",
+) -> None:
+    try:
+        registry.register_tool(tool, source=cast("Any", source))
+    except ValueError:
+        return
 
 
 def _create_langgraph_postgres(config: AgentRuntimeConfig) -> tuple[Checkpointer, BaseStore]:

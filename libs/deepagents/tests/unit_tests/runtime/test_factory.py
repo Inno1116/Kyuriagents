@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import StructuredTool
 
 from deepagents.memory import InMemoryMemoryStore, MemoryRecord, MemoryService
 from deepagents.rag import ChunkMetadata, DocumentChunk, HybridRAGRetriever, InMemoryKeywordStore, InMemoryVectorStore
 from deepagents.runtime import AgentRuntimeConfig, create_kyuri_agent
+from deepagents.tools import ToolDescriptor
 from tests.unit_tests.chat_model import GenericFakeChatModel
 
 
@@ -77,3 +79,26 @@ def test_create_kyuri_agent_wires_retrieval_middleware_with_injected_components(
     assert "PostgreSQL stores durable memory metadata" in content
     assert "<agent_long_term_memory>" in content
     assert "PostgreSQL setup steps kept concrete" in content
+
+
+def test_create_kyuri_agent_adds_preloaded_mcp_tools() -> None:
+    def lookup_status(query: str) -> str:
+        """Look up status."""
+        return f"status: {query}"
+
+    model = GenericFakeChatModel(messages=iter([AIMessage(content="Done.")]))
+    config = AgentRuntimeConfig(
+        enable_rag=False,
+        enable_memory=False,
+        enable_checkpointer=False,
+        enable_mcp=True,
+    )
+
+    agent = create_kyuri_agent(
+        config,
+        model=model,
+        mcp_tools=[StructuredTool.from_function(name="status_lookup", func=lookup_status)],
+        mcp_descriptors=[ToolDescriptor(name="status_lookup", source="mcp", risk="read_only")],
+    )
+
+    assert "status_lookup" in agent.nodes["tools"].bound._tools_by_name

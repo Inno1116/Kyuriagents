@@ -29,7 +29,7 @@ def create_postgres_database(
         import psycopg  # noqa: PLC0415
         from psycopg import sql  # noqa: PLC0415
     except ImportError as exc:
-        msg = "Install `deepagents[memory]` or `psycopg` to initialize PostgreSQL."
+        msg = "Install `deepagents[runtime]` or `psycopg` to initialize PostgreSQL."
         raise ImportError(msg) from exc
 
     with psycopg.connect(admin_dsn, autocommit=True) as connection:
@@ -52,6 +52,7 @@ def apply_deepagents_postgres_schemas(
     dsn: str,
     include_rag: bool = True,
     include_memory: bool = True,
+    include_tools: bool = True,
     include_langgraph: bool = True,
 ) -> None:
     """Apply Deep Agents and LangGraph PostgreSQL schemas.
@@ -60,12 +61,13 @@ def apply_deepagents_postgres_schemas(
         dsn: Application PostgreSQL DSN.
         include_rag: Whether to apply RAG metadata tables.
         include_memory: Whether to apply dynamic memory tables.
+        include_tools: Whether to apply tool and MCP governance tables.
         include_langgraph: Whether to run LangGraph checkpointer/store setup.
     """
     try:
         import psycopg  # noqa: PLC0415
     except ImportError as exc:
-        msg = "Install `deepagents[memory]` or `psycopg` to initialize PostgreSQL."
+        msg = "Install `deepagents[runtime]` or `psycopg` to initialize PostgreSQL."
         raise ImportError(msg) from exc
 
     with psycopg.connect(dsn, autocommit=True) as connection:
@@ -73,6 +75,8 @@ def apply_deepagents_postgres_schemas(
             connection.execute(cast("LiteralString", _resource_text("deepagents.rag", "schemas/postgres_schema.sql")))
         if include_memory:
             connection.execute(cast("LiteralString", _resource_text("deepagents.memory", "schemas/postgres_schema.sql")))
+        if include_tools:
+            connection.execute(cast("LiteralString", _resource_text("deepagents.tools", "schemas/postgres_schema.sql")))
 
     if include_langgraph:
         _setup_langgraph_postgres(dsn)
@@ -85,7 +89,7 @@ def _setup_langgraph_postgres(dsn: str) -> None:
         from langgraph.store.postgres import PostgresStore  # noqa: PLC0415
         from psycopg.rows import dict_row  # noqa: PLC0415
     except ImportError as exc:
-        msg = "Install `deepagents[memory]` to initialize LangGraph PostgreSQL tables."
+        msg = "Install `deepagents[runtime]` to initialize LangGraph PostgreSQL tables."
         raise ImportError(msg) from exc
 
     connect = cast("Any", psycopg.connect)

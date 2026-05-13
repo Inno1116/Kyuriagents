@@ -17,6 +17,10 @@ def test_runtime_config_from_env_parses_services_and_modes() -> None:
             "DEEPAGENTS_POSTGRES_DSN": "postgresql://app",
             "DEEPAGENTS_RAG_MODE": "hybrid",
             "DEEPAGENTS_MEMORY_MODE": "auto",
+            "DEEPAGENTS_ENABLE_MCP": "true",
+            "DEEPAGENTS_MCP_CONFIG_PATH": "mcp.json",
+            "DEEPAGENTS_TOOL_ALLOWED_RISKS": "read_only,external_read,write",
+            "DEEPAGENTS_TOOL_DENIED_NAMES": "execute",
             "RAG_KB_IDS": "kb-main,kb-extra",
         }
     )
@@ -28,6 +32,9 @@ def test_runtime_config_from_env_parses_services_and_modes() -> None:
     assert config.postgres_dsn == "postgresql://app"
     assert config.rag_mode == "hybrid"
     assert config.memory_mode == "auto"
+    assert config.enable_mcp
+    assert config.mcp_config_path == "mcp.json"
+    assert config.tool_policy().denied_tools == frozenset({"execute"})
     assert config.retrieval_defaults().kb_ids == ("kb-main", "kb-extra")
 
 

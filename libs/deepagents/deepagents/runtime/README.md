@@ -6,6 +6,8 @@ This package wires the SDK primitives into a runnable deployment shape:
 - PostgreSQL schema/bootstrap helpers.
 - `PostgresMemoryStore` for durable long-term memory.
 - `RetrievalMiddleware` with RAG and memory enabled from one config object.
+- `ToolGovernanceMiddleware` with policy checks and optional PostgreSQL audit logs.
+- Optional MCP tool loading via `langchain-mcp-adapters`.
 
 Minimal usage:
 
@@ -40,3 +42,7 @@ if config.postgres_dsn:
 ```
 
 API keys should come from environment variables, never from checked-in files.
+
+MCP usage is optional. Set `DEEPAGENTS_ENABLE_MCP=true` and point
+`DEEPAGENTS_MCP_CONFIG_PATH` at a JSON file shaped like `mcp.json.example`.
+Secrets in that file should be referenced as `${ENV_VAR}` placeholders.

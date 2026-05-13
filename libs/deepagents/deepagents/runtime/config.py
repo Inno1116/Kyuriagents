@@ -7,6 +7,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from deepagents.middleware.retrieval import RetrievalMode, RuntimeContextDefaults
+from deepagents.tools import (
+    DEFAULT_ALLOWED_RISKS,
+    DEFAULT_CONFIRMATION_RISKS,
+    ToolContextDefaults,
+    ToolPolicy,
+    ToolRisk,
+    parse_tool_names,
+    parse_tool_risks,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -42,6 +51,16 @@ class AgentRuntimeConfig:
         rag_milvus_db: Optional Milvus database.
         rag_milvus_token: Optional Milvus token.
         rag_kb_ids: Optional default knowledge-base filters.
+        enable_tools: Whether to enable tool governance middleware.
+        enable_mcp: Whether to load MCP tools during runtime startup.
+        tool_allowed_risks: Risk classes allowed to execute.
+        tool_confirmation_risks: Risk classes that require confirmation.
+        tool_allow_requires_confirmation: Whether confirmation-gated tools may execute.
+        tool_allowed_names: Optional tool allow-list.
+        tool_denied_names: Explicit tool deny-list.
+        enable_tool_audit: Whether tool calls should be audited.
+        mcp_config_path: Optional MCP JSON config path.
+        mcp_tool_name_prefix: Whether descriptor matching expects server-prefixed MCP tool names.
     """
 
     tenant_id: str = "default"
@@ -67,6 +86,16 @@ class AgentRuntimeConfig:
     rag_milvus_db: str | None = None
     rag_milvus_token: str | None = None
     rag_kb_ids: tuple[str, ...] = ()
+    enable_tools: bool = True
+    enable_mcp: bool = False
+    tool_allowed_risks: frozenset[ToolRisk] = DEFAULT_ALLOWED_RISKS
+    tool_confirmation_risks: frozenset[ToolRisk] = DEFAULT_CONFIRMATION_RISKS
+    tool_allow_requires_confirmation: bool = False
+    tool_allowed_names: frozenset[str] = frozenset()
+    tool_denied_names: frozenset[str] = frozenset()
+    enable_tool_audit: bool = True
+    mcp_config_path: str | None = None
+    mcp_tool_name_prefix: bool = False
 
     @classmethod
     def from_env(
@@ -113,6 +142,16 @@ class AgentRuntimeConfig:
             rag_milvus_db=_optional_env(source, "RAG_MILVUS_DB"),
             rag_milvus_token=_optional_env(source, "RAG_MILVUS_TOKEN"),
             rag_kb_ids=_tuple_env(source, "RAG_KB_IDS", "DEEPAGENTS_RAG_KB_IDS"),
+            enable_tools=_bool_env(source, "DEEPAGENTS_ENABLE_TOOLS", default=True),
+            enable_mcp=_bool_env(source, "DEEPAGENTS_ENABLE_MCP", default=False),
+            tool_allowed_risks=parse_tool_risks(source.get("DEEPAGENTS_TOOL_ALLOWED_RISKS"), default=DEFAULT_ALLOWED_RISKS),
+            tool_confirmation_risks=parse_tool_risks(source.get("DEEPAGENTS_TOOL_CONFIRMATION_RISKS"), default=DEFAULT_CONFIRMATION_RISKS),
+            tool_allow_requires_confirmation=_bool_env(source, "DEEPAGENTS_TOOL_ALLOW_REQUIRES_CONFIRMATION", default=False),
+            tool_allowed_names=parse_tool_names(source.get("DEEPAGENTS_TOOL_ALLOWED_NAMES")),
+            tool_denied_names=parse_tool_names(source.get("DEEPAGENTS_TOOL_DENIED_NAMES")),
+            enable_tool_audit=_bool_env(source, "DEEPAGENTS_ENABLE_TOOL_AUDIT", default=True),
+            mcp_config_path=_optional_env(source, "DEEPAGENTS_MCP_CONFIG_PATH"),
+            mcp_tool_name_prefix=_bool_env(source, "DEEPAGENTS_MCP_TOOL_NAME_PREFIX", default=False),
         )
 
     def retrieval_defaults(self) -> RuntimeContextDefaults:
@@ -147,6 +186,24 @@ class AgentRuntimeConfig:
         if self.postgres_dsn:
             return ()
         return ("DEEPAGENTS_POSTGRES_DSN",)
+
+    def tool_policy(self) -> ToolPolicy:
+        """Return the configured tool policy."""
+        return ToolPolicy(
+            allowed_risks=self.tool_allowed_risks,
+            confirmation_risks=self.tool_confirmation_risks,
+            allow_requires_confirmation=self.tool_allow_requires_confirmation,
+            allowed_tools=self.tool_allowed_names,
+            denied_tools=self.tool_denied_names,
+        )
+
+    def tool_defaults(self) -> ToolContextDefaults:
+        """Return defaults consumed by `ToolGovernanceMiddleware`."""
+        return ToolContextDefaults(
+            tenant_id=self.tenant_id,
+            user_id=self.user_id,
+            thread_id=self.thread_id,
+        )
 
 
 def _env(source: Mapping[str, str], *names: str, default: str) -> str:
