@@ -95,7 +95,7 @@ class ChunkMetadata:
 
     The fields are intentionally storage-friendly: commonly filtered values are
     scalar columns for Milvus and Elasticsearch, while richer document ownership
-    and lifecycle state belongs in MySQL.
+    and lifecycle state belongs in PostgreSQL.
 
     Args:
         chunk_id: Stable chunk identifier.

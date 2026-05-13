@@ -2,7 +2,7 @@
 
 These files are deployment assets for the hybrid RAG path:
 
-- `mysql_schema.sql`: source-of-truth metadata, access control, document versions, chunk manifests, and ingestion jobs.
+- `postgres_schema.sql`: source-of-truth metadata, access control, document versions, chunk manifests, and ingestion jobs.
 - `milvus_collection.json`: Milvus collection contract for vectors and scalar filters.
 - `elasticsearch_index.json`: Elasticsearch keyword index mapping.
 - `rag.env.example`: local development configuration template.
@@ -21,4 +21,5 @@ Your local defaults are:
 ```txt
 Elasticsearch: http://localhost:9200
 Milvus: http://localhost:19530
+PostgreSQL: postgresql://deepagents:change-me@localhost:5432/deepagents_rag
 ```
