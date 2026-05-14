@@ -93,7 +93,7 @@ class PostgresToolAuditSink:
                     "output_summary": call.output_summary,
                     "duration_ms": call.duration_ms,
                     "error": call.error,
-                    "metadata": call.metadata,
+                    "metadata": _jsonb(call.metadata),
                     "created_at": call.created_at,
                 },
             )
@@ -175,6 +175,15 @@ def _dict_row() -> object:
         msg = "Install `deepagents[runtime]` or `psycopg` to use `PostgresToolAuditSink`."
         raise ImportError(msg) from exc
     return dict_row
+
+
+def _jsonb(value: Mapping[str, object]) -> object:
+    try:
+        from psycopg.types.json import Jsonb  # noqa: PLC0415
+    except ImportError as exc:
+        msg = "Install `deepagents[runtime]` or `psycopg` to use `PostgresToolAuditSink`."
+        raise ImportError(msg) from exc
+    return Jsonb(value)
 
 
 __all__ = [

@@ -59,3 +59,4 @@ def test_postgres_tool_audit_sink_inserts_record() -> None:
     assert params["call_id"] == "call-1"
     assert params["tenant_id"] == "tenant-a"
     assert params["tool_name"] == "search"
+    assert params["metadata"].obj == {}
