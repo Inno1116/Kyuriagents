@@ -185,6 +185,50 @@ CREATE INDEX IF NOT EXISTS idx_rag_ingestion_jobs_scope
 CREATE INDEX IF NOT EXISTS idx_rag_ingestion_jobs_user
     ON rag_ingestion_jobs (requested_by_user_id);
 
+CREATE TABLE IF NOT EXISTS rag_eval_runs (
+    run_id VARCHAR(128) PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL REFERENCES rag_tenants (tenant_id),
+    dataset_name VARCHAR(128) NOT NULL,
+    split VARCHAR(32) NOT NULL DEFAULT '',
+    retriever_name VARCHAR(128) NOT NULL DEFAULT '',
+    status VARCHAR(16) NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_eval_runs_tenant_dataset
+    ON rag_eval_runs (tenant_id, dataset_name, split, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rag_eval_runs_status
+    ON rag_eval_runs (tenant_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS rag_eval_results (
+    run_id VARCHAR(128) NOT NULL REFERENCES rag_eval_runs (run_id) ON DELETE CASCADE,
+    example_id VARCHAR(128) NOT NULL,
+    question_type VARCHAR(32) NOT NULL DEFAULT '',
+    query TEXT NOT NULL DEFAULT '',
+    gold_doc_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    retrieved_doc_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    recall_at_1 NUMERIC(8,6) NOT NULL DEFAULT 0.0,
+    recall_at_2 NUMERIC(8,6) NOT NULL DEFAULT 0.0,
+    recall_at_5 NUMERIC(8,6) NOT NULL DEFAULT 0.0,
+    mrr NUMERIC(8,6) NOT NULL DEFAULT 0.0,
+    ndcg_at_5 NUMERIC(8,6) NOT NULL DEFAULT 0.0,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, example_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_eval_results_question_type
+    ON rag_eval_results (run_id, question_type);
+CREATE INDEX IF NOT EXISTS idx_rag_eval_results_recall
+    ON rag_eval_results (run_id, recall_at_2, recall_at_5);
+
 DROP TRIGGER IF EXISTS trg_rag_tenants_updated_at ON rag_tenants;
 CREATE TRIGGER trg_rag_tenants_updated_at
     BEFORE UPDATE ON rag_tenants
@@ -213,4 +257,9 @@ CREATE TRIGGER trg_rag_chunks_updated_at
 DROP TRIGGER IF EXISTS trg_rag_ingestion_jobs_updated_at ON rag_ingestion_jobs;
 CREATE TRIGGER trg_rag_ingestion_jobs_updated_at
     BEFORE UPDATE ON rag_ingestion_jobs
+    FOR EACH ROW EXECUTE FUNCTION rag_touch_updated_at();
+
+DROP TRIGGER IF EXISTS trg_rag_eval_runs_updated_at ON rag_eval_runs;
+CREATE TRIGGER trg_rag_eval_runs_updated_at
+    BEFORE UPDATE ON rag_eval_runs
     FOR EACH ROW EXECUTE FUNCTION rag_touch_updated_at();

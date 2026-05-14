@@ -14,6 +14,24 @@ from deepagents.rag.metadata import ChunkMetadata, RetrievalScope
 from deepagents.rag.milvus import MilvusVectorStore
 from deepagents.rag.query import IdentityQueryRewriter, QueryRewrite, QueryRewriter
 from deepagents.rag.rerank import FusedScoreReranker, LexicalReranker
+from deepagents.rag.stratrag import (
+    StratRAGAggregateResult,
+    StratRAGDocument,
+    StratRAGEvaluation,
+    StratRAGExample,
+    StratRAGExampleResult,
+    aggregate_stratrag_results,
+    attach_embeddings,
+    build_in_memory_stratrag_retriever,
+    evaluate_stratrag_retriever,
+    load_stratrag_jsonl,
+    mean_reciprocal_rank,
+    ndcg_at_k,
+    parse_stratrag_row,
+    recall_at_k,
+    score_stratrag_example,
+    stratrag_chunks,
+)
 from deepagents.rag.types import (
     DocumentChunk,
     KeywordSearcher,
@@ -40,5 +58,21 @@ __all__ = [
     "Reranker",
     "RetrievalScope",
     "RetrievedChunk",
+    "StratRAGAggregateResult",
+    "StratRAGDocument",
+    "StratRAGEvaluation",
+    "StratRAGExample",
+    "StratRAGExampleResult",
     "VectorSearcher",
+    "aggregate_stratrag_results",
+    "attach_embeddings",
+    "build_in_memory_stratrag_retriever",
+    "evaluate_stratrag_retriever",
+    "load_stratrag_jsonl",
+    "mean_reciprocal_rank",
+    "ndcg_at_k",
+    "parse_stratrag_row",
+    "recall_at_k",
+    "score_stratrag_example",
+    "stratrag_chunks",
 ]
