@@ -74,6 +74,23 @@ class TestCreateDeepAgentMetadata:
         assert agent.config is not None
         assert agent.config["metadata"]["ls_integration"] == "deepagents"
 
+    def test_create_deep_agent_uses_dedicated_summarization_model(self) -> None:
+        """Short-term context summaries can use a cheaper model than the main agent."""
+        model = GenericFakeChatModel(messages=iter([AIMessage(content="ok")]))
+        summary_model = GenericFakeChatModel(messages=iter([AIMessage(content="summary")]))
+        fake_agent = MagicMock()
+        fake_agent.with_config.return_value = "compiled-agent"
+
+        with (
+            patch("deepagents.graph.create_summarization_middleware", return_value=AgentMiddleware()) as mock_summarization,
+            patch("deepagents.graph.create_agent", return_value=fake_agent),
+        ):
+            result = create_deep_agent(model=model, summarization_model=summary_model)
+
+        assert result == "compiled-agent"
+        assert mock_summarization.call_args_list
+        assert all(call.args[0] is summary_model for call in mock_summarization.call_args_list)
+
 
 class TestProfileForModel:
     """Tests for _harness_profile_for_model."""

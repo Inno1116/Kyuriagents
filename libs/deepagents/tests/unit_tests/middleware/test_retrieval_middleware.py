@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 
-from deepagents.memory import InMemoryMemoryStore, MemoryRecord, MemoryService
+from deepagents.memory import InMemoryMemoryStore, MemoryRecord, MemoryScope, MemoryService
 from deepagents.middleware.retrieval import (
     RetrievalMiddleware,
     RuntimeContextDefaults,
@@ -23,6 +23,9 @@ from deepagents.rag import (
     RetrievalScope,
 )
 from tests.unit_tests.chat_model import GenericFakeChatModel
+
+if TYPE_CHECKING:
+    from langchain.agents.middleware.types import AgentState
 
 
 class _Runtime:
@@ -243,6 +246,118 @@ def test_memory_tools_search_save_and_delete() -> None:
     tool_messages = [message for message in result["messages"] if message.type == "tool"]
     assert "Saved memory" in tool_messages[0].text
     assert "OmniEval results reported with exact dates" in tool_messages[1].text
+
+
+def test_retrieval_middleware_saves_memory_checkpoint_every_interval() -> None:
+    store = InMemoryMemoryStore()
+    service = MemoryService(store)
+    middleware = RetrievalMiddleware(
+        memory_service=service,
+        rag_mode="off",
+        memory_mode="tool",
+        defaults=RuntimeContextDefaults(tenant_id="tenant-a", user_id="user-1", thread_id="thread-1"),
+        memory_checkpoint_interval=2,
+        memory_checkpoint_max_chars=800,
+    )
+    runtime = _Runtime(
+        config={
+            "configurable": {
+                "tenant_id": "tenant-a",
+                "user_id": "user-1",
+                "thread_id": "thread-1",
+                "memory_scope_types": ["user"],
+                "memory_scope_ids": ["user-1"],
+            }
+        }
+    )
+    state: AgentState = {
+        "messages": [
+            HumanMessage(content="Remember that password=super-secret must not be saved raw.", id="human-1"),
+            AIMessage(content="I will keep secrets out of long-term memory.", id="ai-1"),
+            HumanMessage(content="Also summarize the RAG testing plan.", id="human-2"),
+            AIMessage(content="We will test RAG, then Memory, then tools.", id="ai-2"),
+        ]
+    }
+
+    middleware.after_agent(state, runtime)
+    middleware.after_agent(state, runtime)
+
+    memories = service.list_memories(scope=MemoryScope(tenant_id="tenant-a", user_id="user-1", active_only=False), limit=10)
+    assert len(memories) == 1
+    memory = memories[0]
+    assert memory.memory_type == "summary"
+    assert memory.scope_type == "user"
+    assert memory.scope_id == "user-1"
+    assert memory.source_thread_id == "thread-1"
+    assert memory.source_message_ids == ("human-1", "ai-1", "human-2", "ai-2")
+    assert "Automatic conversation checkpoint for user turns 1-2." in memory.content
+    assert "Recent user goals:" in memory.content
+    assert "Assistant outcomes:" in memory.content
+    assert "User asked/needed: Remember that password=[redacted] must not be saved raw." in memory.content
+    assert "password=[redacted]" in memory.content
+    assert "super-secret" not in memory.content
+    assert "- user:" not in memory.content
+    assert "- assistant:" not in memory.content
+
+
+def test_retrieval_middleware_checkpoint_deduplicates_repeated_assistant_messages() -> None:
+    store = InMemoryMemoryStore()
+    service = MemoryService(store)
+    middleware = RetrievalMiddleware(
+        memory_service=service,
+        rag_mode="off",
+        memory_mode="tool",
+        defaults=RuntimeContextDefaults(tenant_id="tenant-a", user_id="user-1", thread_id="thread-1"),
+        memory_checkpoint_interval=2,
+        memory_checkpoint_max_chars=800,
+    )
+    runtime = _Runtime(
+        config={
+            "configurable": {
+                "tenant_id": "tenant-a",
+                "user_id": "user-1",
+                "thread_id": "thread-1",
+                "memory_scope_types": ["user"],
+                "memory_scope_ids": ["user-1"],
+            }
+        }
+    )
+    state: AgentState = {
+        "messages": [
+            HumanMessage(content="My name is Jack could you remember me?", id="human-1"),
+            AIMessage(content="Got it, your name is Jack.", id="ai-1"),
+            AIMessage(content="Got it, your name is Jack.", id="ai-1-duplicate"),
+            HumanMessage(content="Do you remember my name?", id="human-2"),
+            AIMessage(content="Yes, your name is Jack.", id="ai-2"),
+            AIMessage(content="Yes, your name is Jack.", id="ai-2-duplicate"),
+        ]
+    }
+
+    middleware.after_agent(state, runtime)
+
+    memories = service.list_memories(scope=MemoryScope(tenant_id="tenant-a", user_id="user-1", active_only=False), limit=10)
+    assert len(memories) == 1
+    content = memories[0].content
+    assert "User identified themselves as Jack." in content
+    assert content.count("Got it, your name is Jack.") == 1
+    assert content.count("Yes, your name is Jack.") == 1
+
+
+def test_retrieval_middleware_skips_checkpoint_before_interval() -> None:
+    store = InMemoryMemoryStore()
+    service = MemoryService(store)
+    middleware = RetrievalMiddleware(
+        memory_service=service,
+        rag_mode="off",
+        memory_mode="tool",
+        defaults=RuntimeContextDefaults(tenant_id="tenant-a", user_id="user-1"),
+        memory_checkpoint_interval=2,
+    )
+
+    middleware.after_agent({"messages": [HumanMessage(content="Only one user turn.")]}, _Runtime())
+
+    memories = service.list_memories(scope=MemoryScope(tenant_id="tenant-a", user_id="user-1", active_only=False), limit=10)
+    assert memories == []
 
 
 def test_format_rag_context_handles_empty_results() -> None:

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, cast
 
 from deepagents.memory.types import MemoryRecord, MemoryScope, MemorySearchResult
+from deepagents.rag._text import tokenize
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -172,7 +173,15 @@ class PostgresMemoryStore:
             raise ValueError(msg)
 
         where, params = _scope_where(scope)
-        params.update({"query": query, "like_query": f"%{query}%", "limit": limit})
+        terms = _search_terms(query)
+        params.update(
+            {
+                "query": query,
+                "like_query": f"%{query}%",
+                "like_terms": [f"%{term}%" for term in terms],
+                "limit": limit,
+            }
+        )
         search_filter = ""
         if query:
             search_filter = """
@@ -180,6 +189,8 @@ class PostgresMemoryStore:
                     to_tsvector('simple', summary || ' ' || content) @@ plainto_tsquery('simple', %(query)s)
                     OR summary ILIKE %(like_query)s
                     OR content ILIKE %(like_query)s
+                    OR summary ILIKE ANY(%(like_terms)s)
+                    OR content ILIKE ANY(%(like_terms)s)
                 )
             """
 
@@ -283,6 +294,23 @@ def _dict_row() -> object:
     return dict_row
 
 
+def _jsonb(value: object) -> object:
+    try:
+        from psycopg.types.json import Jsonb  # noqa: PLC0415
+    except ImportError as exc:
+        msg = "Install `deepagents[memory]` or `psycopg` to use `PostgresMemoryStore`."
+        raise ImportError(msg) from exc
+    return Jsonb(value)
+
+
+def _search_terms(query: str) -> tuple[str, ...]:
+    terms = tuple(dict.fromkeys(tokenize(query)))
+    if terms:
+        return terms
+    stripped = query.strip()
+    return (stripped,) if stripped else ()
+
+
 def _memory_params(memory: MemoryRecord) -> dict[str, object]:
     now = datetime.now(tz=UTC).isoformat()
     return {
@@ -299,8 +327,8 @@ def _memory_params(memory: MemoryRecord) -> dict[str, object]:
         "status": memory.status,
         "visibility": memory.visibility,
         "source_thread_id": memory.source_thread_id,
-        "source_message_ids": list(memory.source_message_ids),
-        "tags": list(memory.tags),
+        "source_message_ids": _jsonb(list(memory.source_message_ids)),
+        "tags": _jsonb(list(memory.tags)),
         "embedding_model": memory.embedding_model,
         "embedding_version": memory.embedding_version,
         "schema_version": memory.schema_version,

@@ -41,11 +41,13 @@ EmbedQuery = Callable[[str], tuple[float, ...]]
 """Callable used by vector stores to embed a query."""
 
 
-def create_dashscope_model(config: AgentRuntimeConfig) -> BaseChatModel:
+def create_dashscope_model(config: AgentRuntimeConfig, *, model_name: str | None = None) -> BaseChatModel:
     """Create a DashScope chat model through the OpenAI-compatible API.
 
     Args:
         config: Runtime configuration.
+        model_name: Optional model override. When omitted, `config.chat_model`
+            is used.
 
     Returns:
         LangChain chat model.
@@ -64,7 +66,7 @@ def create_dashscope_model(config: AgentRuntimeConfig) -> BaseChatModel:
         raise ImportError(msg) from exc
     model_cls = cast("_ChatOpenAIConstructor", ChatOpenAI)
     return model_cls(
-        model=config.chat_model,
+        model=model_name or config.chat_model,
         api_key=config.dashscope_api_key,
         base_url=config.dashscope_base_url,
     )

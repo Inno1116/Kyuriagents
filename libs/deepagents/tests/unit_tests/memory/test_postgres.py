@@ -22,6 +22,8 @@ class _FakeCursor:
         self.calls.append((query, params))
         if "INSERT INTO agent_memory_items" in query:
             row = dict(params or {})
+            row["source_message_ids"] = row["source_message_ids"].obj
+            row["tags"] = row["tags"].obj
             row["metadata"] = {}
             self.fetchone_row = row
         return self
@@ -67,7 +69,8 @@ def test_postgres_memory_store_upserts_and_maps_returned_row() -> None:
     query, params = cursor.calls[0]
     assert "ON CONFLICT (memory_id) DO UPDATE" in query
     assert params["memory_id"] == "mem-1"
-    assert params["tags"] == ["deploy"]
+    assert params["tags"].obj == ["deploy"]
+    assert params["source_message_ids"].obj == []
     assert saved.memory_id == "mem-1"
     assert saved.tags == ("deploy",)
 
@@ -92,9 +95,11 @@ def test_postgres_memory_store_search_applies_scope_filters() -> None:
     query, params = cursor.calls[0]
     assert "tenant_id = %(tenant_id)s" in query
     assert "tags ?& %(tags)s" in query
+    assert "ILIKE ANY(%(like_terms)s)" in query
     assert params["tenant_id"] == "tenant-a"
     assert params["user_id"] == "user-1"
     assert params["tags"] == ["deploy"]
+    assert params["like_terms"] == ["%deployment%"]
     assert results[0].memory_id == "mem-1"
     assert results[0].score == 0.88
 

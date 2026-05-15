@@ -11,6 +11,7 @@ from typing import Annotated, Any, Required, cast
 
 from langchain.agents import AgentState, create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig, TodoListMiddleware
+from langchain.agents.middleware.summarization import ContextSize
 from langchain.agents.middleware.types import AgentMiddleware, ResponseT, _InputAgentState, _OutputAgentState
 from langchain.agents.structured_output import ResponseFormat
 from langchain_anthropic import ChatAnthropic
@@ -183,6 +184,26 @@ def get_default_model() -> ChatAnthropic:
     return _build_default_model()
 
 
+def _create_summarization_stack(
+    model: BaseChatModel,
+    backend: BackendProtocol | BackendFactory,
+    *,
+    enabled: bool,
+    summarization_model: BaseChatModel | None,
+    trigger: ContextSize | list[ContextSize] | None,
+    keep: ContextSize | None,
+) -> list[AgentMiddleware[Any, Any, Any]]:
+    """Create the short-term conversation summarization middleware stack."""
+    if not enabled:
+        return []
+    kwargs: dict[str, Any] = {}
+    if trigger is not None:
+        kwargs["trigger"] = trigger
+    if keep is not None:
+        kwargs["keep"] = keep
+    return [create_summarization_middleware(summarization_model or model, backend, **kwargs)]
+
+
 _REQUIRED_MIDDLEWARE: tuple[tuple[type[AgentMiddleware[Any, Any, Any]], tuple[str, ...]], ...] = (
     (FilesystemMiddleware, ()),
     (SubAgentMiddleware, ()),
@@ -229,6 +250,10 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     context_schema: type[ContextT] | None = None,
     checkpointer: Checkpointer | None = None,
     store: BaseStore | None = None,
+    enable_summarization: bool = True,
+    summarization_model: BaseChatModel | None = None,
+    summarization_trigger: ContextSize | list[ContextSize] | None = None,
+    summarization_keep: ContextSize | None = None,
     debug: bool = False,
     name: str | None = None,
     cache: BaseCache | None = None,
@@ -318,7 +343,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
                 [`CompiledSubAgent`][deepagents.middleware.subagents.CompiledSubAgent]
                 — are available)
             - [`AsyncSubAgentMiddleware`][deepagents.middleware.async_subagents.AsyncSubAgentMiddleware] (if async `subagents` are provided)
-            - [`SummarizationMiddleware`][langchain.agents.middleware.SummarizationMiddleware]
+            - [`SummarizationMiddleware`][langchain.agents.middleware.SummarizationMiddleware] (if enabled)
             - [`PatchToolCallsMiddleware`][deepagents.middleware.patch_tool_calls.PatchToolCallsMiddleware]
 
             *User middleware is inserted here.*
@@ -447,6 +472,14 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             uses `StoreBackend`).
 
             Passed through to [`create_agent`][langchain.agents.create_agent].
+        enable_summarization: Whether to include Deep Agents' short-term
+            conversation summarization middleware.
+        summarization_model: Optional cheaper model used only for short-term
+            context summarization. Omit to reuse the agent model.
+        summarization_trigger: Optional override for when automatic
+            summarization runs. Leave unset to use model-aware defaults.
+        summarization_keep: Optional override for how much recent context is
+            preserved after summarization. Omit to use model-aware defaults.
         debug: Whether to enable debug mode.
 
             Passed through to [`create_agent`][langchain.agents.create_agent].
@@ -551,7 +584,14 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
                     custom_tool_descriptions=_subagent_profile.tool_description_overrides,
                     _permissions=subagent_permissions,
                 ),
-                create_summarization_middleware(subagent_model, backend),
+                *_create_summarization_stack(
+                    subagent_model,
+                    backend,
+                    enabled=enable_summarization,
+                    summarization_model=summarization_model,
+                    trigger=summarization_trigger,
+                    keep=summarization_keep,
+                ),
                 PatchToolCallsMiddleware(),
             ]
             subagent_skills = spec.get("skills")
@@ -623,7 +663,14 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
                 custom_tool_descriptions=_profile.tool_description_overrides,
                 _permissions=permissions,
             ),
-            create_summarization_middleware(model, backend),
+            *_create_summarization_stack(
+                model,
+                backend,
+                enabled=enable_summarization,
+                summarization_model=summarization_model,
+                trigger=summarization_trigger,
+                keep=summarization_keep,
+            ),
             PatchToolCallsMiddleware(),
         ]
         if skills is not None:
@@ -695,7 +742,14 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
         deepagent_middleware.append(sub_agent_middleware)
     deepagent_middleware.extend(
         [
-            create_summarization_middleware(model, backend),
+            *_create_summarization_stack(
+                model,
+                backend,
+                enabled=enable_summarization,
+                summarization_model=summarization_model,
+                trigger=summarization_trigger,
+                keep=summarization_keep,
+            ),
             PatchToolCallsMiddleware(),
         ]
     )

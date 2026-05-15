@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, cast, get_args
+from typing import Any, Literal, cast, get_args
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -40,6 +42,28 @@ MemoryScopeResolver = Callable[[object], MemoryScope]
 _MEMORY_TYPES = frozenset(get_args(MemoryType))
 _MEMORY_SCOPE_TYPES = frozenset(get_args(MemoryScopeType))
 _MEMORY_VISIBILITIES = frozenset(get_args(MemoryVisibility))
+_DEFAULT_MEMORY_CHECKPOINT_INTERVAL = 10
+_DEFAULT_MEMORY_CHECKPOINT_MAX_CHARS = 3_000
+_MAX_MEMORY_CHECKPOINT_SUMMARY_CHARS = 500
+_MAX_MEMORY_CHECKPOINT_FACTS = 5
+_MAX_MEMORY_CHECKPOINT_GOALS = 7
+_MAX_MEMORY_CHECKPOINT_OUTCOMES = 5
+_MAX_MEMORY_CHECKPOINT_BULLET_CHARS = 220
+_SECRET_ASSIGNMENT_RE = re.compile(r"(?i)\b(api[_-]?key|secret|token|password|passwd|pwd)\s*[:=]\s*([^\s,;]+)")
+_BEARER_SECRET_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+")
+_KEYLIKE_SECRET_RE = re.compile(r"\b(?:sk|pk|ak)-[A-Za-z0-9][A-Za-z0-9._\-]{12,}\b")
+_USER_NAME_RE = re.compile(r"(?i)\b(?:my name is|i am|i'm|call me)\s+([A-Z][A-Za-z0-9_\-]{1,40})\b")
+_PREFERENCE_RE = re.compile(r"(?i)\b(?:i prefer|i like|i want|i wanna|i would like|please|could you|can you)\b")
+_CORRECTION_RE = re.compile(r"(?i)\b(?:actually|correction|instead|not that|no thank you|forget that)\b")
+_GOAL_RE = re.compile(r"(?i)\b(?:remember|summarize|test|check|tell me|show me|find|search|compare)\b")
+
+
+@dataclass(frozen=True, kw_only=True)
+class _CheckpointTurn:
+    """Compact representation of one user turn for memory checkpoints."""
+
+    user_text: str
+    assistant_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -50,11 +74,13 @@ class RuntimeContextDefaults:
         tenant_id: Fallback tenant identifier when runtime config does not
             provide one.
         user_id: Optional fallback user identifier.
+        thread_id: Optional fallback thread identifier.
         kb_ids: Optional fallback knowledge-base identifiers for RAG.
     """
 
     tenant_id: str = "default"
     user_id: str | None = None
+    thread_id: str | None = None
     kb_ids: tuple[str, ...] = ()
 
 
@@ -179,6 +205,10 @@ class RetrievalMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         memory_tool_top_k: Default memories returned by the memory search tool.
         min_rag_score: Minimum RAG score for automatic injection.
         min_memory_score: Minimum memory score for automatic injection.
+        memory_checkpoint_interval: Number of user turns between automatic
+            long-term memory checkpoints. Set to `0` to disable.
+        memory_checkpoint_max_chars: Maximum characters saved in one automatic
+            memory checkpoint.
     """
 
     def __init__(
@@ -199,6 +229,8 @@ class RetrievalMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         memory_tool_top_k: int = 10,
         min_rag_score: float = 0.0,
         min_memory_score: float = 0.0,
+        memory_checkpoint_interval: int = _DEFAULT_MEMORY_CHECKPOINT_INTERVAL,
+        memory_checkpoint_max_chars: int = _DEFAULT_MEMORY_CHECKPOINT_MAX_CHARS,
     ) -> None:
         """Initialize the retrieval middleware."""
         self._rag_retriever = rag_retriever
@@ -216,6 +248,8 @@ class RetrievalMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
         self._memory_tool_top_k = _positive("memory_tool_top_k", memory_tool_top_k)
         self._min_rag_score = min_rag_score
         self._min_memory_score = min_memory_score
+        self._memory_checkpoint_interval = _non_negative("memory_checkpoint_interval", memory_checkpoint_interval)
+        self._memory_checkpoint_max_chars = _positive("memory_checkpoint_max_chars", memory_checkpoint_max_chars)
         self.tools = self._build_tools()
 
     def _build_tools(self) -> list[BaseTool]:
@@ -258,7 +292,8 @@ class RetrievalMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     def _retrieve_memory_context(self, query: str, runtime: object, *, limit: int) -> str:
         if self._memory_service is None:
             return ""
-        results = self._memory_service.search(query, scope=self._resolve_memory_scope(runtime), limit=limit)
+        scope = self._resolve_memory_scope(runtime)
+        results = self._memory_service.search(query, scope=scope, limit=limit)
         filtered = [result for result in results if result.score >= self._min_memory_score]
         if not filtered:
             return ""
@@ -311,6 +346,16 @@ class RetrievalMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
     ) -> ModelResponse[ResponseT]:
         """Inject retrieval context before an asynchronous model call."""
         return await handler(self.modify_request(request))
+
+    def after_agent(self, state: AgentState, runtime: object) -> dict[str, Any] | None:
+        """Persist a deterministic long-term memory checkpoint after the agent run."""
+        self._maybe_save_memory_checkpoint(state.get("messages", []), runtime)
+        return None
+
+    async def aafter_agent(self, state: AgentState, runtime: object) -> dict[str, Any] | None:
+        """Async variant of `after_agent`."""
+        self._maybe_save_memory_checkpoint(state.get("messages", []), runtime)
+        return None
 
     def _build_search_knowledge_base_tool(self) -> BaseTool:
         middleware = self
@@ -378,7 +423,7 @@ class RetrievalMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
                     importance=importance,
                     confidence=confidence,
                     visibility=resolved_visibility,
-                    source_thread_id=_thread_id(runtime),
+                    source_thread_id=_thread_id(runtime) or middleware._defaults.thread_id,
                 ),
                 tenant_id=resolved_scope.tenant_id,
                 user_id=resolved_scope.user_id,
@@ -411,6 +456,59 @@ class RetrievalMiddleware(AgentMiddleware[AgentState, ContextT, ResponseT]):
             name="delete_memory",
             func=delete_memory,
             description="Soft-delete a long-term memory item when it is wrong, outdated, or no longer useful.",
+        )
+
+    def _maybe_save_memory_checkpoint(self, messages: list[AnyMessage], runtime: object) -> None:
+        if self._memory_service is None or self._memory_checkpoint_interval == 0:
+            return
+        human_count = _human_message_count(messages)
+        if human_count == 0 or human_count % self._memory_checkpoint_interval != 0:
+            return
+
+        segment = human_count // self._memory_checkpoint_interval
+        memory_scope = self._resolve_memory_scope(runtime)
+        scope_type = memory_scope.scope_types[0] if memory_scope.scope_types else cast("MemoryScopeType", "user")
+        scope_id = _default_memory_scope_id(memory_scope, scope_type)
+        thread_id = _thread_id(runtime) or self._defaults.thread_id
+        thread_key = thread_id or _conversation_fingerprint(messages)
+        memory_id = _memory_checkpoint_id(memory_scope.tenant_id, scope_type, scope_id, thread_key, segment)
+        visibility = cast("MemoryVisibility", "private" if memory_scope.user_id is not None else "team")
+        lookup_scope = MemoryScope(
+            tenant_id=memory_scope.tenant_id,
+            user_id=memory_scope.user_id,
+            scope_types=(scope_type,),
+            scope_ids=(scope_id,),
+            active_only=False,
+        )
+        if self._memory_service.get(memory_id, scope=lookup_scope) is not None:
+            return
+
+        recent = _recent_turn_messages(messages, self._memory_checkpoint_interval)
+        start_turn = ((segment - 1) * self._memory_checkpoint_interval) + 1
+        content = _build_memory_checkpoint_content(
+            recent,
+            start_turn=start_turn,
+            end_turn=human_count,
+            max_chars=self._memory_checkpoint_max_chars,
+        )
+        summary = _truncate_text(f"Auto memory checkpoint for turns {start_turn}-{human_count}.", _MAX_MEMORY_CHECKPOINT_SUMMARY_CHARS)
+        self._memory_service.save_candidate(
+            MemoryWriteCandidate(
+                content=content,
+                memory_type="summary",
+                scope_type=scope_type,
+                scope_id=scope_id,
+                summary=summary,
+                importance=0.6,
+                confidence=0.7,
+                visibility=visibility,
+                tags=("auto", "conversation-checkpoint"),
+                source_thread_id=thread_id,
+                source_message_ids=_message_ids(recent),
+            ),
+            tenant_id=memory_scope.tenant_id,
+            user_id=memory_scope.user_id,
+            memory_id=memory_id,
         )
 
 
@@ -484,6 +582,13 @@ def _positive(name: str, value: int) -> int:
     return value
 
 
+def _non_negative(name: str, value: int) -> int:
+    if value < 0:
+        msg = f"`{name}` must not be negative."
+        raise ValueError(msg)
+    return value
+
+
 def _has_auto(mode: RetrievalMode) -> bool:
     return mode in {"auto", "hybrid"}
 
@@ -522,6 +627,203 @@ def _default_memory_scope_id(scope: MemoryScope, scope_type: MemoryScopeType) ->
 def _thread_id(runtime: object) -> str | None:
     values = _runtime_values(runtime)
     return _optional_string(values.get("thread_id"))
+
+
+def _human_message_count(messages: list[AnyMessage]) -> int:
+    return sum(1 for message in messages if isinstance(message, HumanMessage))
+
+
+def _recent_turn_messages(messages: list[AnyMessage], interval: int) -> list[AnyMessage]:
+    selected: list[AnyMessage] = []
+    human_count = 0
+    for message in reversed(messages):
+        selected.append(message)
+        if isinstance(message, HumanMessage):
+            human_count += 1
+            if human_count >= interval:
+                break
+    selected.reverse()
+    return selected
+
+
+def _build_memory_checkpoint_content(
+    messages: list[AnyMessage],
+    *,
+    start_turn: int,
+    end_turn: int,
+    max_chars: int,
+) -> str:
+    turns = _checkpoint_turns(messages)
+    sections = [f"Automatic conversation checkpoint for user turns {start_turn}-{end_turn}."]
+    facts = _checkpoint_facts(turns)
+    goals = _checkpoint_goals(turns)
+    outcomes = _checkpoint_outcomes(turns)
+
+    if facts:
+        sections.append(_checkpoint_section("Durable user facts and preferences", facts))
+    if goals:
+        sections.append(_checkpoint_section("Recent user goals", goals))
+    if outcomes:
+        sections.append(_checkpoint_section("Assistant outcomes", outcomes))
+    if len(sections) == 1:
+        sections.append("- No durable user facts, preferences, goals, or decisions were identified in this checkpoint.")
+    return _truncate_multiline_text("\n".join(sections), max_chars)
+
+
+def _checkpoint_role(message: AnyMessage) -> str | None:
+    if isinstance(message, HumanMessage):
+        return "user"
+    if message.type == "ai":
+        return "assistant"
+    return None
+
+
+def _checkpoint_turns(messages: list[AnyMessage]) -> list[_CheckpointTurn]:
+    turns: list[_CheckpointTurn] = []
+    current_user = ""
+    assistant_texts: list[str] = []
+    seen_assistant: set[str] = set()
+
+    def flush() -> None:
+        nonlocal current_user, assistant_texts, seen_assistant
+        if current_user:
+            turns.append(_CheckpointTurn(user_text=current_user, assistant_texts=tuple(assistant_texts)))
+        current_user = ""
+        assistant_texts = []
+        seen_assistant = set()
+
+    for message in messages:
+        role = _checkpoint_role(message)
+        if role is None:
+            continue
+        text = _redact_sensitive(_message_text(message))
+        if not text:
+            continue
+        if role == "user":
+            flush()
+            current_user = text
+            continue
+        fingerprint = _checkpoint_text_fingerprint(text)
+        if fingerprint in seen_assistant:
+            continue
+        seen_assistant.add(fingerprint)
+        assistant_texts.append(text)
+    flush()
+    return turns
+
+
+def _checkpoint_facts(turns: list[_CheckpointTurn]) -> list[str]:
+    facts: list[str] = []
+    for turn in turns:
+        user_text = turn.user_text
+        name_match = _USER_NAME_RE.search(user_text)
+        if name_match:
+            facts.append(f"User identified themselves as {name_match.group(1)}.")
+        if _PREFERENCE_RE.search(user_text):
+            facts.append(f"User preference/request: {_checkpoint_bullet_text(user_text)}")
+        if _CORRECTION_RE.search(user_text):
+            facts.append(f"User correction: {_checkpoint_bullet_text(user_text)}")
+    return _dedupe_bullets(facts, limit=_MAX_MEMORY_CHECKPOINT_FACTS)
+
+
+def _checkpoint_goals(turns: list[_CheckpointTurn]) -> list[str]:
+    goals: list[str] = []
+    for turn in turns:
+        text = turn.user_text
+        if "?" in text or _PREFERENCE_RE.search(text) or _CORRECTION_RE.search(text) or _GOAL_RE.search(text):
+            goals.append(f"User asked/needed: {_checkpoint_bullet_text(text)}")
+    return _dedupe_bullets(goals, limit=_MAX_MEMORY_CHECKPOINT_GOALS)
+
+
+def _checkpoint_outcomes(turns: list[_CheckpointTurn]) -> list[str]:
+    outcomes: list[str] = []
+    for turn in turns:
+        if not turn.assistant_texts:
+            continue
+        outcomes.append(f"Assistant response: {_checkpoint_bullet_text(turn.assistant_texts[-1])}")
+    return _dedupe_bullets(outcomes, limit=_MAX_MEMORY_CHECKPOINT_OUTCOMES)
+
+
+def _checkpoint_section(title: str, bullets: list[str]) -> str:
+    lines = [f"{title}:"]
+    lines.extend(f"- {bullet}" for bullet in bullets)
+    return "\n".join(lines)
+
+
+def _checkpoint_bullet_text(text: str) -> str:
+    return _truncate_text(text, _MAX_MEMORY_CHECKPOINT_BULLET_CHARS)
+
+
+def _dedupe_bullets(bullets: list[str], *, limit: int) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for bullet in bullets:
+        key = _checkpoint_text_fingerprint(bullet)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(bullet)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _checkpoint_text_fingerprint(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _message_text(message: AnyMessage) -> str:
+    value = getattr(message, "text", "")
+    if isinstance(value, str) and value:
+        return " ".join(value.split())
+    return " ".join(str(message.content).split())
+
+
+def _redact_sensitive(text: str) -> str:
+    redacted = _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=[redacted]", text)
+    redacted = _BEARER_SECRET_RE.sub("Bearer [redacted]", redacted)
+    return _KEYLIKE_SECRET_RE.sub("[redacted-secret]", redacted)
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    suffix = "...[truncated]"
+    if max_chars <= len(suffix):
+        return suffix[:max_chars]
+    return normalized[: max_chars - len(suffix)].rstrip() + suffix
+
+
+def _truncate_multiline_text(text: str, max_chars: int) -> str:
+    normalized = "\n".join(line for line in (" ".join(line.split()) for line in text.splitlines()) if line)
+    if len(normalized) <= max_chars:
+        return normalized
+    suffix = "...[truncated]"
+    if max_chars <= len(suffix):
+        return suffix[:max_chars]
+    return normalized[: max_chars - len(suffix)].rstrip() + suffix
+
+
+def _message_ids(messages: list[AnyMessage]) -> tuple[str, ...]:
+    ids = [message.id for message in messages if message.id]
+    return tuple(dict.fromkeys(ids))
+
+
+def _conversation_fingerprint(messages: list[AnyMessage]) -> str:
+    digest = hashlib.sha256()
+    for message in messages:
+        digest.update(message.type.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_message_text(message).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()[:24]
+
+
+def _memory_checkpoint_id(tenant_id: str, scope_type: str, scope_id: str, thread_key: str, segment: int) -> str:
+    raw = f"{tenant_id}|{scope_type}|{scope_id}|{thread_key}|{segment}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"mem_checkpoint_{digest}"
 
 
 __all__ = [

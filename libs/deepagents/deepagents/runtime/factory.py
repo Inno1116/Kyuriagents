@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 from deepagents.graph import create_deep_agent
-from deepagents.memory import MemoryService, PostgresMemoryStore
+from deepagents.memory import ElasticsearchMilvusMemoryIndexer, MemoryHybridSearcher, MemoryService, PostgresMemoryStore
 from deepagents.middleware.retrieval import RetrievalMiddleware
 from deepagents.rag import ElasticsearchKeywordStore, HybridRAGRetriever, MilvusVectorStore
 from deepagents.runtime.dashscope import EmbedQuery, create_dashscope_embed_query, create_dashscope_model
@@ -80,12 +80,17 @@ def create_kyuri_agent(
         Compiled Deep Agent graph.
     """
     resolved_model = model if model is not None else create_dashscope_model(config)
+    summarization_model = _create_summarization_model(config)
     resolved_embed_query = embed_query
     if config.enable_rag and rag_retriever is None:
         resolved_embed_query = resolved_embed_query or create_dashscope_embed_query(config)
         rag_retriever = _create_rag_retriever(config, resolved_embed_query)
     if config.enable_memory and memory_service is None:
-        memory_service = _create_memory_service(config)
+        memory_service = _create_memory_service(
+            config,
+            hybrid_retriever=rag_retriever if config.enable_rag else None,
+            embed_text=resolved_embed_query,
+        )
 
     resolved_checkpointer = checkpointer
     resolved_store = store
@@ -100,6 +105,8 @@ def create_kyuri_agent(
         rag_mode=config.rag_mode,
         memory_mode=config.memory_mode,
         defaults=config.retrieval_defaults(),
+        memory_checkpoint_interval=config.memory_checkpoint_interval,
+        memory_checkpoint_max_chars=config.memory_checkpoint_max_chars,
     )
     resolved_tools, governance = _build_tool_runtime(
         config,
@@ -122,9 +129,19 @@ def create_kyuri_agent(
         middleware=resolved_middleware,
         checkpointer=resolved_checkpointer,
         store=resolved_store,
+        enable_summarization=config.enable_context_summarization,
+        summarization_model=summarization_model,
+        summarization_trigger=config.context_summary_trigger(),
+        summarization_keep=config.context_summary_keep(),
         debug=debug,
         name=name,
     )
+
+
+def _create_summarization_model(config: AgentRuntimeConfig) -> BaseChatModel | None:
+    if not config.enable_context_summarization or not config.context_summary_model:
+        return None
+    return create_dashscope_model(config, model_name=config.context_summary_model)
 
 
 def _create_rag_retriever(config: AgentRuntimeConfig, embed_query: EmbedQuery) -> HybridRAGRetriever:
@@ -143,12 +160,48 @@ def _create_rag_retriever(config: AgentRuntimeConfig, embed_query: EmbedQuery) -
     )
 
 
-def _create_memory_service(config: AgentRuntimeConfig) -> MemoryService:
+def _create_memory_service(
+    config: AgentRuntimeConfig,
+    *,
+    hybrid_retriever: HybridRAGRetriever | None = None,
+    embed_text: EmbedQuery | None = None,
+) -> MemoryService:
     if not config.postgres_dsn:
         missing = ", ".join(config.missing_for_memory())
         msg = f"Missing settings for memory runtime: {missing}."
         raise ValueError(msg)
-    return MemoryService(PostgresMemoryStore(dsn=config.postgres_dsn))
+    store = PostgresMemoryStore(dsn=config.postgres_dsn)
+    hybrid_searcher = None
+    indexer = None
+    if hybrid_retriever is not None and embed_text is not None:
+        memory_retriever = _create_memory_retriever(config, embed_text)
+        hybrid_searcher = MemoryHybridSearcher(retriever=memory_retriever, store=store)
+        indexer = ElasticsearchMilvusMemoryIndexer(
+            es_index=config.memory_es_index,
+            es_url=config.rag_es_url,
+            milvus_collection=config.memory_milvus_collection,
+            milvus_uri=config.rag_milvus_uri,
+            milvus_token=config.rag_milvus_token,
+            milvus_db=config.rag_milvus_db,
+            embed_text=embed_text,
+        )
+    return MemoryService(store, hybrid_searcher=hybrid_searcher, indexer=indexer)
+
+
+def _create_memory_retriever(config: AgentRuntimeConfig, embed_query: EmbedQuery) -> HybridRAGRetriever:
+    return HybridRAGRetriever(
+        vector_searcher=MilvusVectorStore(
+            collection_name=config.memory_milvus_collection,
+            uri=config.rag_milvus_uri,
+            token=config.rag_milvus_token,
+            db_name=config.rag_milvus_db,
+            embed_query=embed_query,
+        ),
+        keyword_searcher=ElasticsearchKeywordStore(
+            index=config.memory_es_index,
+            url=config.rag_es_url,
+        ),
+    )
 
 
 def _build_tool_runtime(

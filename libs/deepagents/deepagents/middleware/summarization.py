@@ -54,7 +54,7 @@ import logging
 import uuid
 import warnings
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, NotRequired, cast
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Final, NotRequired, cast
 
 from langchain.agents.middleware.summarization import (
     _DEFAULT_MESSAGES_TO_KEEP,
@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     from deepagents.backends.protocol import BACKEND_TYPES, BackendProtocol
 
 logger = logging.getLogger(__name__)
+_DEFAULT_FACTORY_VALUE: Final = object()
 
 
 class CompactConversationSchema(BaseModel):
@@ -1122,6 +1123,10 @@ This is the name external callers should import and reference.
 def create_summarization_middleware(
     model: BaseChatModel,
     backend: BACKEND_TYPES,
+    *,
+    trigger: ContextSize | list[ContextSize] | None | object = _DEFAULT_FACTORY_VALUE,
+    keep: ContextSize | object = _DEFAULT_FACTORY_VALUE,
+    truncate_args_settings: TruncateArgsSettings | None | object = _DEFAULT_FACTORY_VALUE,
 ) -> _DeepAgentsSummarizationMiddleware:
     """Create a Deep Agents `SummarizationMiddleware` with model-aware defaults.
 
@@ -1163,6 +1168,14 @@ def create_summarization_middleware(
 
             Use `resolve_model()` first if needed for model strings.
         backend: Backend instance or factory for persisting conversation history.
+        trigger: Optional override for when automatic summarization runs. Omit
+            to use model-aware defaults. Pass `None` to disable automatic
+            summarization while keeping overflow handling available.
+        keep: Optional override for how much recent context is preserved after
+            summarization. Omit to use model-aware defaults.
+        truncate_args_settings: Optional override for old tool-argument
+            truncation. Omit to use model-aware defaults. Pass `None` to
+            disable tool-argument truncation.
 
     Returns:
         Configured `SummarizationMiddleware` instance.
@@ -1177,13 +1190,20 @@ def create_summarization_middleware(
         raise TypeError(msg)
 
     defaults = compute_summarization_defaults(model)
+    resolved_trigger = defaults["trigger"] if trigger is _DEFAULT_FACTORY_VALUE else cast("ContextSize | list[ContextSize] | None", trigger)
+    resolved_keep = defaults["keep"] if keep is _DEFAULT_FACTORY_VALUE else cast("ContextSize", keep)
+    resolved_truncate_args_settings = (
+        defaults["truncate_args_settings"]
+        if truncate_args_settings is _DEFAULT_FACTORY_VALUE
+        else cast("TruncateArgsSettings | None", truncate_args_settings)
+    )
     return SummarizationMiddleware(
         model=model,
         backend=backend,
-        trigger=defaults["trigger"],
-        keep=defaults["keep"],
+        trigger=resolved_trigger,
+        keep=resolved_keep,
         trim_tokens_to_summarize=None,
-        truncate_args_settings=defaults["truncate_args_settings"],
+        truncate_args_settings=resolved_truncate_args_settings,
     )
 
 

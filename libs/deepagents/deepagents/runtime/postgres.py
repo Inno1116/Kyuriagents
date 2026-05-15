@@ -53,6 +53,7 @@ def apply_deepagents_postgres_schemas(
     include_rag: bool = True,
     include_memory: bool = True,
     include_tools: bool = True,
+    include_api: bool = True,
     include_langgraph: bool = True,
 ) -> None:
     """Apply Deep Agents and LangGraph PostgreSQL schemas.
@@ -62,6 +63,7 @@ def apply_deepagents_postgres_schemas(
         include_rag: Whether to apply RAG metadata tables.
         include_memory: Whether to apply dynamic memory tables.
         include_tools: Whether to apply tool and MCP governance tables.
+        include_api: Whether to apply user center and API service tables.
         include_langgraph: Whether to run LangGraph checkpointer/store setup.
     """
     try:
@@ -77,6 +79,8 @@ def apply_deepagents_postgres_schemas(
             connection.execute(cast("LiteralString", _resource_text("deepagents.memory", "schemas/postgres_schema.sql")))
         if include_tools:
             connection.execute(cast("LiteralString", _resource_text("deepagents.tools", "schemas/postgres_schema.sql")))
+        if include_api:
+            connection.execute(cast("LiteralString", _resource_text("deepagents.server", "schemas/postgres_schema.sql")))
 
     if include_langgraph:
         _setup_langgraph_postgres(dsn)

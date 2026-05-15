@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
+
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 
@@ -66,11 +69,14 @@ def test_create_kyuri_agent_wires_retrieval_middleware_with_injected_components(
         memory_mode="auto",
     )
 
-    agent = create_kyuri_agent(
-        config,
-        model=model,
-        rag_retriever=_retriever(),
-        memory_service=_memory_service(),
+    agent = cast(
+        "Any",
+        create_kyuri_agent(
+            config,
+            model=model,
+            rag_retriever=_retriever(),
+            memory_service=_memory_service(),
+        ),
     )
     agent.invoke({"messages": [HumanMessage(content="How do we set up postgres memory?")]})
 
@@ -94,11 +100,56 @@ def test_create_kyuri_agent_adds_preloaded_mcp_tools() -> None:
         enable_mcp=True,
     )
 
-    agent = create_kyuri_agent(
-        config,
-        model=model,
-        mcp_tools=[StructuredTool.from_function(name="status_lookup", func=lookup_status)],
-        mcp_descriptors=[ToolDescriptor(name="status_lookup", source="mcp", risk="read_only")],
+    agent = cast(
+        "Any",
+        create_kyuri_agent(
+            config,
+            model=model,
+            mcp_tools=[StructuredTool.from_function(name="status_lookup", func=lookup_status)],
+            mcp_descriptors=[ToolDescriptor(name="status_lookup", source="mcp", risk="read_only")],
+        ),
     )
 
     assert "status_lookup" in agent.nodes["tools"].bound._tools_by_name
+
+
+def test_create_kyuri_agent_passes_context_summarization_settings() -> None:
+    model = GenericFakeChatModel(messages=iter([AIMessage(content="Done.")]))
+    config = AgentRuntimeConfig(
+        enable_rag=False,
+        enable_memory=False,
+        enable_checkpointer=False,
+        enable_context_summarization=True,
+        context_summary_trigger_messages=32,
+        context_summary_keep_messages=10,
+    )
+
+    with patch("deepagents.runtime.factory.create_deep_agent", return_value=MagicMock()) as mock_create:
+        create_kyuri_agent(config, model=model)
+
+    kwargs = mock_create.call_args.kwargs
+    assert kwargs["enable_summarization"] is True
+    assert kwargs["summarization_trigger"] == ("messages", 32)
+    assert kwargs["summarization_keep"] == ("messages", 10)
+
+
+def test_create_kyuri_agent_uses_dedicated_context_summary_model() -> None:
+    model = GenericFakeChatModel(messages=iter([AIMessage(content="Done.")]))
+    summary_model = GenericFakeChatModel(messages=iter([AIMessage(content="Summary.")]))
+    config = AgentRuntimeConfig(
+        enable_rag=False,
+        enable_memory=False,
+        enable_checkpointer=False,
+        enable_context_summarization=True,
+        context_summary_model="qwen-turbo",
+    )
+
+    with (
+        patch("deepagents.runtime.factory.create_dashscope_model", return_value=summary_model) as mock_dashscope,
+        patch("deepagents.runtime.factory.create_deep_agent", return_value=MagicMock()) as mock_create,
+    ):
+        create_kyuri_agent(config, model=model)
+
+    mock_dashscope.assert_called_once_with(config, model_name="qwen-turbo")
+    assert mock_create.call_args.kwargs["model"] is model
+    assert mock_create.call_args.kwargs["summarization_model"] is summary_model

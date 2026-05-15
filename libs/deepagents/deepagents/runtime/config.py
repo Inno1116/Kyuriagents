@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from deepagents.middleware.retrieval import RetrievalMode, RuntimeContextDefaults
 from deepagents.tools import (
@@ -34,6 +34,8 @@ class AgentRuntimeConfig:
         dashscope_api_key: DashScope API key.
         dashscope_base_url: OpenAI-compatible DashScope base URL.
         chat_model: Chat model name.
+        context_summary_model: Optional cheaper chat model for short-term
+            summarization. When omitted, the main chat model is used.
         embedding_model: Embedding model name.
         embedding_dimensions: Optional embedding dimension override.
         postgres_dsn: Application PostgreSQL DSN.
@@ -51,6 +53,23 @@ class AgentRuntimeConfig:
         rag_milvus_db: Optional Milvus database.
         rag_milvus_token: Optional Milvus token.
         rag_kb_ids: Optional default knowledge-base filters.
+        memory_es_index: Elasticsearch index for memory chunks.
+        memory_milvus_collection: Milvus collection for memory vectors.
+        memory_checkpoint_interval: Number of user turns between automatic
+            long-term memory checkpoints. Use `0` to disable.
+        memory_checkpoint_max_chars: Maximum characters saved in one automatic
+            memory checkpoint.
+        enable_context_summarization: Whether to enable short-term thread
+            summarization before model calls.
+        context_summary_trigger_messages: Number of messages that triggers
+            short-term conversation summarization. Use `0` to fall back to
+            model-aware defaults.
+        context_summary_keep_messages: Number of recent messages preserved
+            after short-term conversation summarization.
+        api_admin_key: Optional bootstrap key for API admin endpoints.
+        auth_token_ttl_days: Number of days before login tokens expire. Use `0`
+            for non-expiring tokens in local development.
+        api_cors_origins: Browser origins allowed to call the API.
         enable_tools: Whether to enable tool governance middleware.
         enable_mcp: Whether to load MCP tools during runtime startup.
         tool_allowed_risks: Risk classes allowed to execute.
@@ -69,6 +88,7 @@ class AgentRuntimeConfig:
     dashscope_api_key: str | None = None
     dashscope_base_url: str = _DASHSCOPE_BASE_URL
     chat_model: str = "qwen-plus"
+    context_summary_model: str | None = None
     embedding_model: str = "text-embedding-v3"
     embedding_dimensions: int | None = None
     postgres_dsn: str | None = None
@@ -86,6 +106,16 @@ class AgentRuntimeConfig:
     rag_milvus_db: str | None = None
     rag_milvus_token: str | None = None
     rag_kb_ids: tuple[str, ...] = ()
+    memory_es_index: str = "memory_chunks"
+    memory_milvus_collection: str = "memory_chunks"
+    memory_checkpoint_interval: int = 10
+    memory_checkpoint_max_chars: int = 3_000
+    enable_context_summarization: bool = True
+    context_summary_trigger_messages: int = 40
+    context_summary_keep_messages: int = 12
+    api_admin_key: str | None = None
+    auth_token_ttl_days: int = 30
+    api_cors_origins: tuple[str, ...] = ("http://127.0.0.1:5173", "http://localhost:5173")
     enable_tools: bool = True
     enable_mcp: bool = False
     tool_allowed_risks: frozenset[ToolRisk] = DEFAULT_ALLOWED_RISKS
@@ -96,6 +126,18 @@ class AgentRuntimeConfig:
     enable_tool_audit: bool = True
     mcp_config_path: str | None = None
     mcp_tool_name_prefix: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate context window settings."""
+        if self.context_summary_trigger_messages < 0:
+            msg = "`context_summary_trigger_messages` must not be negative."
+            raise ValueError(msg)
+        if self.context_summary_keep_messages <= 0:
+            msg = "`context_summary_keep_messages` must be positive."
+            raise ValueError(msg)
+        if self.context_summary_trigger_messages > 0 and self.context_summary_trigger_messages <= self.context_summary_keep_messages:
+            msg = "`context_summary_trigger_messages` must be greater than `context_summary_keep_messages`."
+            raise ValueError(msg)
 
     @classmethod
     def from_env(
@@ -125,6 +167,7 @@ class AgentRuntimeConfig:
             dashscope_api_key=_optional_env(source, "DASHSCOPE_API_KEY"),
             dashscope_base_url=_env(source, "DASHSCOPE_BASE_URL", default=_DASHSCOPE_BASE_URL),
             chat_model=_env(source, "DASHSCOPE_CHAT_MODEL", "DEEPAGENTS_CHAT_MODEL", default="qwen-plus"),
+            context_summary_model=_optional_env(source, "DEEPAGENTS_CONTEXT_SUMMARY_MODEL", "DASHSCOPE_CONTEXT_SUMMARY_MODEL"),
             embedding_model=_env(source, "DASHSCOPE_EMBEDDING_MODEL", "DEEPAGENTS_EMBEDDING_MODEL", default="text-embedding-v3"),
             embedding_dimensions=_optional_int_env(source, "DASHSCOPE_EMBEDDING_DIMENSIONS", "DEEPAGENTS_EMBEDDING_DIMENSIONS"),
             postgres_dsn=_optional_env(source, "DEEPAGENTS_POSTGRES_DSN", "MEMORY_POSTGRES_DSN", "RAG_POSTGRES_DSN"),
@@ -142,6 +185,16 @@ class AgentRuntimeConfig:
             rag_milvus_db=_optional_env(source, "RAG_MILVUS_DB"),
             rag_milvus_token=_optional_env(source, "RAG_MILVUS_TOKEN"),
             rag_kb_ids=_tuple_env(source, "RAG_KB_IDS", "DEEPAGENTS_RAG_KB_IDS"),
+            memory_es_index=_env(source, "MEMORY_ES_INDEX", default="memory_chunks"),
+            memory_milvus_collection=_env(source, "MEMORY_MILVUS_COLLECTION", default="memory_chunks"),
+            memory_checkpoint_interval=_int_env(source, "DEEPAGENTS_MEMORY_CHECKPOINT_INTERVAL", default=10),
+            memory_checkpoint_max_chars=_int_env(source, "DEEPAGENTS_MEMORY_CHECKPOINT_MAX_CHARS", default=3_000),
+            enable_context_summarization=_bool_env(source, "DEEPAGENTS_ENABLE_CONTEXT_SUMMARIZATION", default=True),
+            context_summary_trigger_messages=_int_env(source, "DEEPAGENTS_CONTEXT_SUMMARY_TRIGGER_MESSAGES", default=40),
+            context_summary_keep_messages=_int_env(source, "DEEPAGENTS_CONTEXT_SUMMARY_KEEP_MESSAGES", default=12),
+            api_admin_key=_optional_env(source, "DEEPAGENTS_API_ADMIN_KEY"),
+            auth_token_ttl_days=_int_env(source, "DEEPAGENTS_AUTH_TOKEN_TTL_DAYS", default=30),
+            api_cors_origins=_tuple_env(source, "DEEPAGENTS_API_CORS_ORIGINS") or ("http://127.0.0.1:5173", "http://localhost:5173"),
             enable_tools=_bool_env(source, "DEEPAGENTS_ENABLE_TOOLS", default=True),
             enable_mcp=_bool_env(source, "DEEPAGENTS_ENABLE_MCP", default=False),
             tool_allowed_risks=parse_tool_risks(source.get("DEEPAGENTS_TOOL_ALLOWED_RISKS"), default=DEFAULT_ALLOWED_RISKS),
@@ -163,6 +216,7 @@ class AgentRuntimeConfig:
         return RuntimeContextDefaults(
             tenant_id=self.tenant_id,
             user_id=self.user_id,
+            thread_id=self.thread_id,
             kb_ids=self.rag_kb_ids,
         )
 
@@ -205,6 +259,16 @@ class AgentRuntimeConfig:
             thread_id=self.thread_id,
         )
 
+    def context_summary_trigger(self) -> tuple[Literal["messages"], int] | None:
+        """Return the short-term summarization trigger for Deep Agents."""
+        if self.context_summary_trigger_messages == 0:
+            return None
+        return ("messages", self.context_summary_trigger_messages)
+
+    def context_summary_keep(self) -> tuple[Literal["messages"], int]:
+        """Return the recent-message retention setting for summarization."""
+        return ("messages", self.context_summary_keep_messages)
+
 
 def _env(source: Mapping[str, str], *names: str, default: str) -> str:
     for name in names:
@@ -233,6 +297,13 @@ def _optional_int_env(source: Mapping[str, str], *names: str) -> int | None:
     value = _optional_env(source, *names)
     if value is None:
         return None
+    return int(value)
+
+
+def _int_env(source: Mapping[str, str], *names: str, default: int) -> int:
+    value = _optional_env(source, *names)
+    if value is None:
+        return default
     return int(value)
 
 

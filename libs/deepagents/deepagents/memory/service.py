@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
+from deepagents.memory.compression import MemoryContextBudget, MemoryContextCompressor
 from deepagents.memory.types import MemoryRecord, MemoryScope, MemorySearchResult, MemoryStore, MemoryWriteCandidate
 
+if TYPE_CHECKING:
+    from deepagents.memory.indexing import MemoryHybridSearcher, MemoryIndexer
 
-def format_memory_context(results: list[MemorySearchResult]) -> str:
+_LOGGER = logging.getLogger(__name__)
+
+
+def format_memory_context(
+    results: list[MemorySearchResult],
+    *,
+    compressor: MemoryContextCompressor | None = None,
+) -> str:
     """Format retrieved memories for prompt injection.
 
     Args:
         results: Ranked memory search results.
+        compressor: Optional compressor used before formatting.
 
     Returns:
         XML-like context block containing only relevant memories.
@@ -20,14 +33,19 @@ def format_memory_context(results: list[MemorySearchResult]) -> str:
     if not results:
         return "<agent_long_term_memory>\n(No relevant long-term memory found.)\n</agent_long_term_memory>"
 
+    compressed = (compressor or MemoryContextCompressor()).compress(results)
     lines = ["<agent_long_term_memory>"]
-    for result in results:
+    for result in compressed.results:
         memory = result.memory
         text = memory.summary or memory.content
         lines.append(
             f"- [{memory.memory_type}; scope={memory.scope_type}/{memory.scope_id}; "
             f"confidence={memory.confidence:.2f}; importance={memory.importance:.2f}] {text}"
         )
+    if compressed.omitted_count:
+        lines.append(f"- [omitted] {compressed.omitted_count} additional memories were omitted by the memory context budget.")
+    if compressed.truncated_count:
+        lines.append(f"- [truncated] {compressed.truncated_count} memories were shortened to fit the memory context budget.")
     lines.append("</agent_long_term_memory>")
     return "\n".join(lines)
 
@@ -39,13 +57,26 @@ class MemoryService:
     this service stamps tenant, owner, and audit metadata before persistence.
     """
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(
+        self,
+        store: MemoryStore,
+        *,
+        compressor: MemoryContextCompressor | None = None,
+        hybrid_searcher: MemoryHybridSearcher | None = None,
+        indexer: MemoryIndexer | None = None,
+    ) -> None:
         """Initialize the service.
 
         Args:
             store: Durable memory store.
+            compressor: Optional memory context compressor.
+            hybrid_searcher: Optional hybrid memory searcher.
+            indexer: Optional retrieval index synchronizer.
         """
         self._store = store
+        self._compressor = compressor or MemoryContextCompressor()
+        self._hybrid_searcher = hybrid_searcher
+        self._indexer = indexer
 
     def save_candidate(
         self,
@@ -86,7 +117,24 @@ class MemoryService:
             updated_at=now,
             expires_at=candidate.expires_at,
         )
-        return self._store.upsert(record)
+        return self.upsert_record(record)
+
+    def upsert_record(self, record: MemoryRecord) -> MemoryRecord:
+        """Persist one memory record and update the retrieval index.
+
+        Args:
+            record: Memory record.
+
+        Returns:
+            Persisted memory record.
+        """
+        saved = self._store.upsert(record)
+        if self._indexer is not None:
+            try:
+                self._indexer.upsert([saved])
+            except Exception as exc:  # noqa: BLE001  # memory store remains authoritative when retrieval indexes lag
+                _LOGGER.warning("Failed to index long-term memory `%s`: %s", saved.memory_id, exc)
+        return saved
 
     def search(
         self,
@@ -105,6 +153,13 @@ class MemoryService:
         Returns:
             Ranked memory results.
         """
+        if self._hybrid_searcher is not None:
+            try:
+                results = self._hybrid_searcher.search(query, scope=scope, limit=limit)
+                if results:
+                    return results
+            except Exception as exc:  # noqa: BLE001  # fallback to PostgreSQL when ES/Milvus is unavailable
+                _LOGGER.warning("Hybrid memory search failed; falling back to PostgreSQL memory search: %s", exc)
         return self._store.search(query, scope=scope, limit=limit)
 
     def build_context(
@@ -124,7 +179,7 @@ class MemoryService:
         Returns:
             Prompt-ready long-term memory context block.
         """
-        return format_memory_context(self.search(query, scope=scope, limit=limit))
+        return format_memory_context(self.search(query, scope=scope, limit=limit), compressor=self._compressor)
 
     def get(self, memory_id: str, *, scope: MemoryScope) -> MemoryRecord | None:
         """Load one visible memory record.
@@ -138,6 +193,18 @@ class MemoryService:
         """
         return self._store.get(memory_id, scope=scope)
 
+    def list_memories(self, *, scope: MemoryScope, limit: int = 100) -> list[MemoryRecord]:
+        """List memories visible to the caller.
+
+        Args:
+            scope: Tenant and authorization filters.
+            limit: Maximum records to return.
+
+        Returns:
+            Visible memory records.
+        """
+        return self._store.list_memories(scope=scope, limit=limit)
+
     def delete(self, memory_id: str, *, scope: MemoryScope) -> bool:
         """Soft delete one visible memory record.
 
@@ -148,4 +215,15 @@ class MemoryService:
         Returns:
             `True` when a record was updated.
         """
-        return self._store.delete(memory_id, scope=scope)
+        deleted = self._store.delete(memory_id, scope=scope)
+        if deleted and self._indexer is not None:
+            try:
+                self._indexer.delete([memory_id])
+            except Exception as exc:  # noqa: BLE001  # deleted memory remains hidden by PostgreSQL status filters
+                _LOGGER.warning("Failed to delete long-term memory `%s` from retrieval indexes: %s", memory_id, exc)
+        return deleted
+
+    @property
+    def memory_context_budget(self) -> MemoryContextBudget:
+        """Return the active memory context budget."""
+        return self._compressor.budget

@@ -42,6 +42,22 @@ def test_factory_uses_fallback_defaults_without_profile() -> None:
     assert middleware._truncate_args_keep == ("messages", 20)
 
 
+def test_factory_accepts_context_window_overrides() -> None:
+    """Allows runtime code to tune short-term context summarization."""
+    model = _make_model(with_profile_limit=None)
+    middleware = create_summarization_middleware(
+        model,
+        cast("Any", MagicMock()),
+        trigger=("messages", 40),
+        keep=("messages", 12),
+        truncate_args_settings=None,
+    )
+
+    assert middleware._lc_helper.trigger == ("messages", 40)
+    assert middleware._lc_helper.keep == ("messages", 12)
+    assert middleware._truncate_args_trigger is None
+
+
 def test_factory_rejects_string_model() -> None:
     """Raises `TypeError` when called with a string model name."""
     with pytest.raises(TypeError, match="BaseChatModel"):
