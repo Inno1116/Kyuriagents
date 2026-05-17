@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Annotated, Any, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, TypeVar, cast
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from deepagents.ingestion import KnowledgeBaseService
 from deepagents.runtime import AgentRuntimeConfig, create_kyuri_agent
 from deepagents.server.identity import AuthContext, DuplicateUserError, MessageRecord, PostgresUserCenter, ThreadRecord, UserCenter
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
 
 class _Agent(Protocol):
@@ -25,12 +29,37 @@ class _Agent(Protocol):
         """Invoke the agent with LangGraph-style input."""
         ...
 
+    def stream(
+        self,
+        input_data: object,
+        /,
+        *,
+        config: Mapping[str, object] | None = None,
+        stream_mode: object | None = None,
+    ) -> Iterable[object]:
+        """Stream the agent with LangGraph-style input."""
+        ...
+
 
 class ThreadNotFoundError(LookupError):
     """Raised when a user cannot access the requested thread."""
 
 
+@dataclass
+class _StreamState:
+    """Mutable state for one streaming chat response."""
+
+    buffered_text_parts: list[str] = field(default_factory=list)
+    emitted_text: bool = False
+    initial_model_pending: bool = True
+    tool_finished: bool = False
+    tool_started: bool = False
+
+
 _MIN_PASSWORD_LENGTH = 8
+_STREAM_ITEM_PAIR_LENGTH = 2
+_STREAM_ITEM_TRIPLE_LENGTH = 3
+_KnowledgeResult = TypeVar("_KnowledgeResult")
 _DEFAULT_API_SYSTEM_PROMPT = """You are Kyuriagents, a careful agent with access to tools, RAG, and long-term memory.
 
 Answer the user's question directly and in the user's language unless they ask otherwise.
@@ -39,6 +68,8 @@ For comparison questions, state the conclusion first, then give the supporting f
 Do not narrate internal reasoning, do not say what the user "appears to be asking", and do not mention search mechanics unless the user asks.
 If the available context is insufficient, say so briefly and name the missing information.
 """
+ParserMode = Literal["auto", "local", "mcp"]
+Visibility = Literal["private", "team", "public"]
 
 
 class RegisterRequest(BaseModel):
@@ -95,12 +126,22 @@ class ThreadCreateRequest(BaseModel):
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
+class KnowledgeBaseCreateRequest(BaseModel):
+    """Request body for creating a user knowledge base."""
+
+    name: str
+    description: str = ""
+    visibility: Visibility = "private"
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
 class ChatRequest(BaseModel):
     """Request body for sending a user message."""
 
     message: str
     thread_id: str | None = None
     title: str = ""
+    rag_enabled: bool | None = None
 
 
 class RecordResponse(BaseModel):
@@ -137,6 +178,7 @@ def create_app(
     *,
     config: AgentRuntimeConfig | None = None,
     user_center: UserCenter | None = None,
+    knowledge_service: KnowledgeBaseService | None = None,
     agent_factory: Callable[..., object] | None = None,
 ) -> FastAPI:
     """Create the FastAPI application.
@@ -144,6 +186,7 @@ def create_app(
     Args:
         config: Runtime configuration. Defaults to `AgentRuntimeConfig.from_env()`.
         user_center: Optional user center store. Defaults to PostgreSQL.
+        knowledge_service: Optional knowledge-base ingestion service.
         agent_factory: Optional agent factory for tests.
 
     Returns:
@@ -154,12 +197,19 @@ def create_app(
     """
     resolved_config = config or AgentRuntimeConfig.from_env()
     resolved_center = user_center or _postgres_user_center(resolved_config)
+    resolved_knowledge = knowledge_service or KnowledgeBaseService(config=resolved_config)
     resolved_agent_factory = agent_factory or create_kyuri_agent
     app = FastAPI(title="Deep Agents API", version="0.1.0")
     _configure_cors(app, resolved_config)
     _register_auth_routes(app=app, config=resolved_config, user_center=resolved_center)
     _register_admin_routes(app=app, config=resolved_config, user_center=resolved_center)
-    _register_user_routes(app=app, config=resolved_config, user_center=resolved_center, agent_factory=resolved_agent_factory)
+    _register_user_routes(
+        app=app,
+        config=resolved_config,
+        user_center=resolved_center,
+        knowledge_service=resolved_knowledge,
+        agent_factory=resolved_agent_factory,
+    )
     return app
 
 
@@ -262,11 +312,13 @@ def _register_user_routes(
     app: FastAPI,
     config: AgentRuntimeConfig,
     user_center: UserCenter,
+    knowledge_service: KnowledgeBaseService,
     agent_factory: Callable[..., object],
 ) -> None:
     """Register authenticated user and chat routes."""
     require_auth = _make_auth_dependency(user_center)
     _register_user_metadata_routes(app=app, user_center=user_center, require_auth=require_auth)
+    _register_knowledge_routes(app=app, config=config, knowledge_service=knowledge_service, require_auth=require_auth)
     _register_chat_route(app=app, config=config, user_center=user_center, agent_factory=agent_factory, require_auth=require_auth)
 
 
@@ -357,6 +409,101 @@ def _register_user_metadata_routes(
         return RecordResponse(data={"messages": [_record_dict(message) for message in messages]})
 
 
+def _register_knowledge_routes(
+    *,
+    app: FastAPI,
+    config: AgentRuntimeConfig,
+    knowledge_service: KnowledgeBaseService,
+    require_auth: Callable[..., AuthContext],
+) -> None:
+    """Register knowledge-base upload and ingestion routes."""
+    auth_dependency = cast("AuthContext", Depends(require_auth))
+
+    @app.post("/v1/knowledge-bases", response_model=RecordResponse)
+    def create_knowledge_base(request: KnowledgeBaseCreateRequest, context: AuthContext = auth_dependency) -> RecordResponse:
+        kb = _call_knowledge_service(lambda: _create_knowledge_base_for_context(knowledge_service, request, context))
+        return RecordResponse(data=_record_dict(kb))
+
+    @app.get("/v1/knowledge-bases", response_model=RecordResponse)
+    def list_knowledge_bases(context: AuthContext = auth_dependency, limit: int = 50) -> RecordResponse:
+        items = _call_knowledge_service(
+            lambda: knowledge_service.list_knowledge_bases(
+                tenant_id=context.tenant.tenant_id,
+                user_id=context.user.user_id,
+                limit=limit,
+            )
+        )
+        return RecordResponse(data={"knowledge_bases": [_record_dict(item) for item in items]})
+
+    @app.delete("/v1/knowledge-bases/{kb_id}", response_model=RecordResponse)
+    def delete_knowledge_base(kb_id: str, context: AuthContext = auth_dependency) -> RecordResponse:
+        kb = _call_knowledge_service(
+            lambda: knowledge_service.delete_knowledge_base(
+                tenant_id=context.tenant.tenant_id,
+                user_id=context.user.user_id,
+                kb_id=kb_id,
+            )
+        )
+        return RecordResponse(data=_record_dict(kb))
+
+    @app.post("/v1/knowledge-bases/{kb_id}/documents", response_model=RecordResponse)
+    async def upload_document(
+        kb_id: str,
+        request: Request,
+        filename: Annotated[str, Query(min_length=1)],
+        parser_mode: Annotated[str | None, Query()] = None,
+        context: AuthContext = auth_dependency,
+    ) -> RecordResponse:
+        content = await request.body()
+        document, job = _call_knowledge_service(
+            lambda: _upload_document_for_context(
+                knowledge_service,
+                context=context,
+                kb_id=kb_id,
+                filename=filename,
+                mime_type=request.headers.get("content-type", ""),
+                content=content,
+                parser_mode=_parser_mode(parser_mode, default=config.ingestion_parser_mode),
+            )
+        )
+        return RecordResponse(data={"document": _record_dict(document), "job": _record_dict(job)})
+
+    @app.get("/v1/knowledge-bases/{kb_id}/documents", response_model=RecordResponse)
+    def list_documents(kb_id: str, context: AuthContext = auth_dependency, limit: int = 100) -> RecordResponse:
+        documents = _call_knowledge_service(
+            lambda: knowledge_service.list_documents(
+                tenant_id=context.tenant.tenant_id,
+                user_id=context.user.user_id,
+                kb_id=kb_id,
+                limit=limit,
+            )
+        )
+        return RecordResponse(data={"documents": [_record_dict(document) for document in documents]})
+
+    @app.delete("/v1/knowledge-bases/{kb_id}/documents/{doc_id}", response_model=RecordResponse)
+    def delete_document(kb_id: str, doc_id: str, context: AuthContext = auth_dependency) -> RecordResponse:
+        document = _call_knowledge_service(
+            lambda: knowledge_service.delete_document(
+                tenant_id=context.tenant.tenant_id,
+                user_id=context.user.user_id,
+                kb_id=kb_id,
+                doc_id=doc_id,
+            )
+        )
+        return RecordResponse(data=_record_dict(document))
+
+    @app.get("/v1/ingestion/jobs/{job_id}", response_model=RecordResponse)
+    def get_ingestion_job(job_id: str, context: AuthContext = auth_dependency) -> RecordResponse:
+        job = knowledge_service.get_job(
+            tenant_id=context.tenant.tenant_id,
+            user_id=context.user.user_id,
+            job_id=job_id,
+        )
+        if job is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ingestion job not found.")
+        return RecordResponse(data=_record_dict(job))
+
+
 def _register_chat_route(
     *,
     app: FastAPI,
@@ -382,31 +529,11 @@ def _register_chat_route(
             role="user",
             content=request.message,
         )
-        agent_config = replace(
-            config,
-            tenant_id=context.tenant.tenant_id,
-            user_id=context.user.user_id,
-            thread_id=thread.thread_id,
-        )
+        agent_config = _chat_runtime_config(config, context=context, thread=thread, request=request)
         agent = cast("_Agent", agent_factory(agent_config, system_prompt=_DEFAULT_API_SYSTEM_PROMPT))
         result = agent.invoke(
-            {
-                "messages": _agent_messages(
-                    history,
-                    user_message=user_message,
-                    use_checkpointer=agent_config.enable_checkpointer,
-                )
-            },
-            config={
-                "configurable": {
-                    "tenant_id": context.tenant.tenant_id,
-                    "user_id": context.user.user_id,
-                    "thread_id": thread.thread_id,
-                    "tool_thread_id": thread.thread_id,
-                    "memory_scope_types": ["user"],
-                    "memory_scope_ids": [context.user.user_id],
-                }
-            },
+            _chat_input(history, user_message=user_message, agent_config=agent_config),
+            config=_graph_config(context=context, thread=thread),
         )
         content = _assistant_text(cast("Mapping[str, object]", result))
         assistant_message = user_center.append_message(
@@ -418,12 +545,411 @@ def _register_chat_route(
         )
         return ChatResponse(thread_id=thread.thread_id, message_id=assistant_message.message_id, content=content)
 
+    @app.post("/v1/chat/stream")
+    def chat_stream(request: ChatRequest, context: AuthContext = auth_dependency) -> StreamingResponse:
+        try:
+            thread = _resolve_thread(user_center, context=context, request=request)
+        except ThreadNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.") from exc
+        history = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=thread.thread_id, limit=100)
+        user_message = user_center.append_message(
+            tenant_id=context.tenant.tenant_id,
+            thread_id=thread.thread_id,
+            user_id=context.user.user_id,
+            role="user",
+            content=request.message,
+        )
+        agent_config = _chat_runtime_config(config, context=context, thread=thread, request=request)
+        agent = cast("_Agent", agent_factory(agent_config, system_prompt=_DEFAULT_API_SYSTEM_PROMPT))
+        return StreamingResponse(
+            _chat_event_source(
+                agent=agent,
+                user_center=user_center,
+                context=context,
+                thread=thread,
+                input_data=_chat_input(history, user_message=user_message, agent_config=agent_config),
+                graph_config=_graph_config(context=context, thread=thread),
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+
+def _chat_runtime_config(
+    config: AgentRuntimeConfig,
+    *,
+    context: AuthContext,
+    thread: ThreadRecord,
+    request: ChatRequest,
+) -> AgentRuntimeConfig:
+    runtime = replace(
+        config,
+        tenant_id=context.tenant.tenant_id,
+        user_id=context.user.user_id,
+        thread_id=thread.thread_id,
+    )
+    if request.rag_enabled is False:
+        return replace(runtime, rag_mode="off")
+    return runtime
+
+
+def _chat_input(
+    history: Sequence[MessageRecord],
+    *,
+    user_message: MessageRecord,
+    agent_config: AgentRuntimeConfig,
+) -> dict[str, list[object]]:
+    return {
+        "messages": _agent_messages(
+            history,
+            user_message=user_message,
+            use_checkpointer=agent_config.enable_checkpointer,
+        )
+    }
+
+
+def _graph_config(*, context: AuthContext, thread: ThreadRecord) -> dict[str, dict[str, object]]:
+    return {
+        "configurable": {
+            "tenant_id": context.tenant.tenant_id,
+            "user_id": context.user.user_id,
+            "thread_id": thread.thread_id,
+            "tool_thread_id": thread.thread_id,
+            "memory_scope_types": ["user"],
+            "memory_scope_ids": [context.user.user_id],
+        }
+    }
+
+
+def _chat_event_source(
+    *,
+    agent: _Agent,
+    user_center: UserCenter,
+    context: AuthContext,
+    thread: ThreadRecord,
+    input_data: Mapping[str, object],
+    graph_config: Mapping[str, object],
+) -> Iterator[str]:
+    content_parts: list[str] = []
+    final_content = ""
+    seen_tools: set[str] = set()
+    stream_state = _StreamState()
+    yield _sse("message_start", {"thread_id": thread.thread_id})
+    try:
+        stream = agent.stream(input_data, config=graph_config, stream_mode=["messages", "updates"])
+        for item in stream:
+            mode, data = _stream_item_parts(item)
+            if mode == "messages":
+                yield from _message_stream_events(data, content_parts=content_parts, seen_tools=seen_tools, stream_state=stream_state)
+            elif mode == "updates":
+                if not _tool_call_names_from_update(data):
+                    final_content = _assistant_text_from_update(data) or final_content
+                yield from _update_stream_events(data, content_parts=content_parts, seen_tools=seen_tools, stream_state=stream_state)
+        content = final_content or "".join(content_parts)
+        assistant_message = user_center.append_message(
+            tenant_id=context.tenant.tenant_id,
+            thread_id=thread.thread_id,
+            user_id=context.user.user_id,
+            role="assistant",
+            content=content,
+        )
+        yield _sse(
+            "done",
+            {
+                "thread_id": thread.thread_id,
+                "message_id": assistant_message.message_id,
+                "content": content,
+                "replace": not stream_state.emitted_text,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001  # Streaming endpoints must send errors after headers are committed.
+        yield _sse("error", {"detail": str(exc)})
+
+
+def _stream_item_parts(item: object) -> tuple[str, object]:
+    if isinstance(item, tuple):
+        if len(item) == _STREAM_ITEM_PAIR_LENGTH:
+            mode, data = item
+            return str(mode), data
+        if len(item) == _STREAM_ITEM_TRIPLE_LENGTH:
+            _, mode, data = item
+            return str(mode), data
+    return "", item
+
+
+def _message_stream_events(
+    data: object,
+    *,
+    content_parts: list[str],
+    seen_tools: set[str],
+    stream_state: _StreamState,
+) -> Iterator[str]:
+    chunk = _stream_message_chunk(data)
+    if chunk is None:
+        return
+    tool_names = _message_tool_names(chunk)
+    for tool_name in tool_names:
+        if tool_name not in seen_tools:
+            seen_tools.add(tool_name)
+            yield _sse("status", {"text": _tool_status_text(tool_name), "tool": tool_name})
+    if tool_names:
+        stream_state.buffered_text_parts.clear()
+        stream_state.initial_model_pending = False
+        stream_state.tool_started = True
+        return
+    text = _message_delta_text(chunk)
+    if text:
+        if stream_state.initial_model_pending and not stream_state.tool_finished:
+            stream_state.buffered_text_parts.append(text)
+            return
+        if stream_state.tool_started and not stream_state.tool_finished:
+            return
+        content_parts.append(text)
+        stream_state.emitted_text = True
+        yield _sse("delta", {"text": text})
+
+
+def _update_stream_events(
+    data: object,
+    *,
+    content_parts: list[str],
+    seen_tools: set[str],
+    stream_state: _StreamState,
+) -> Iterator[str]:
+    tool_call_names = _tool_call_names_from_update(data)
+    for tool_name in tool_call_names:
+        if tool_name not in seen_tools:
+            seen_tools.add(tool_name)
+            yield _sse("status", {"text": _tool_status_text(tool_name), "tool": tool_name})
+    if tool_call_names:
+        stream_state.buffered_text_parts.clear()
+        stream_state.initial_model_pending = False
+        stream_state.tool_started = True
+    for tool_name in _tool_result_names(data):
+        stream_state.initial_model_pending = False
+        stream_state.tool_finished = True
+        yield _sse("status", {"text": f"Finished {tool_name}.", "tool": tool_name})
+    if stream_state.initial_model_pending and not stream_state.tool_started:
+        yield from _flush_buffered_text(content_parts=content_parts, stream_state=stream_state)
+
+
+def _flush_buffered_text(*, content_parts: list[str], stream_state: _StreamState) -> Iterator[str]:
+    buffered = "".join(stream_state.buffered_text_parts)
+    stream_state.buffered_text_parts.clear()
+    stream_state.initial_model_pending = False
+    if not buffered:
+        return
+    content_parts.append(buffered)
+    stream_state.emitted_text = True
+    yield _sse("delta", {"text": buffered})
+
+
+def _stream_message_chunk(data: object) -> object | None:
+    if isinstance(data, tuple) and data:
+        return data[0]
+    return data
+
+
+def _message_delta_text(message: object) -> str:
+    message_type = str(getattr(message, "type", ""))
+    class_name = type(message).__name__
+    if message_type == "tool" or ("AIMessage" not in class_name and message_type not in {"ai", "AIMessageChunk"}):
+        return ""
+    return _content_text(getattr(message, "content", ""))
+
+
+def _content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, Mapping):
+                text = cast("Mapping[str, object]", block).get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _message_tool_names(message: object) -> list[str]:
+    names: list[str] = []
+    for attr in ("tool_calls", "tool_call_chunks"):
+        calls = getattr(message, attr, None)
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            name = _tool_call_name(call)
+            if name:
+                names.append(name)
+    return names
+
+
+def _tool_call_name(call: object) -> str:
+    if isinstance(call, Mapping):
+        name = cast("Mapping[str, object]", call).get("name")
+        if isinstance(name, str):
+            return name
+    name = getattr(call, "name", "")
+    if isinstance(name, str):
+        return name
+    return ""
+
+
+def _assistant_text_from_update(update: object) -> str:
+    if not isinstance(update, Mapping):
+        return ""
+    for value in update.values():
+        if isinstance(value, Mapping):
+            text = _assistant_text(cast("Mapping[str, object]", value))
+            if text:
+                return text
+    return _assistant_text(cast("Mapping[str, object]", update))
+
+
+def _tool_call_names_from_update(update: object) -> list[str]:
+    names: list[str] = []
+    for message in _messages_from_update(update):
+        names.extend(_message_tool_names(message))
+    return names
+
+
+def _tool_result_names(update: object) -> list[str]:
+    names: list[str] = []
+    for message in _messages_from_update(update):
+        if getattr(message, "type", None) != "tool":
+            continue
+        name = getattr(message, "name", "")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _messages_from_update(update: object) -> list[object]:
+    if not isinstance(update, Mapping):
+        return []
+    messages: list[object] = []
+    for value in update.values():
+        if not isinstance(value, Mapping):
+            continue
+        update_messages = cast("Mapping[str, object]", value).get("messages")
+        if not isinstance(update_messages, list):
+            continue
+        messages.extend(update_messages)
+    return messages
+
+
+def _tool_status_text(tool_name: str) -> str:
+    if tool_name == "search_knowledge_base":
+        return "Searching knowledge base..."
+    if tool_name == "search_memory":
+        return "Searching memory..."
+    if tool_name == "save_memory":
+        return "Saving memory..."
+    if tool_name == "delete_memory":
+        return "Updating memory..."
+    return f"Using {tool_name}..."
+
+
+def _sse(event: str, payload: Mapping[str, object]) -> str:
+    data = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {data}\n\n"
+
 
 def _postgres_user_center(config: AgentRuntimeConfig) -> PostgresUserCenter:
     if not config.postgres_dsn:
         msg = "Set `DEEPAGENTS_POSTGRES_DSN` before starting the API server."
         raise ValueError(msg)
     return PostgresUserCenter(dsn=config.postgres_dsn)
+
+
+def _call_knowledge_service(action: Callable[[], _KnowledgeResult]) -> _KnowledgeResult:
+    try:
+        return action()
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except Exception as exc:
+        _raise_if_postgres_schema_drift(exc)
+        raise
+
+
+def _create_knowledge_base_for_context(
+    knowledge_service: KnowledgeBaseService,
+    request: KnowledgeBaseCreateRequest,
+    context: AuthContext,
+) -> object:
+    _ensure_rag_identity(knowledge_service, context)
+    return knowledge_service.create_knowledge_base(
+        tenant_id=context.tenant.tenant_id,
+        user_id=context.user.user_id,
+        name=request.name,
+        description=request.description,
+        visibility=request.visibility,
+        metadata=request.metadata,
+    )
+
+
+def _upload_document_for_context(
+    knowledge_service: KnowledgeBaseService,
+    *,
+    context: AuthContext,
+    kb_id: str,
+    filename: str,
+    mime_type: str,
+    content: bytes,
+    parser_mode: ParserMode,
+) -> tuple[object, object]:
+    _ensure_rag_identity(knowledge_service, context)
+    return knowledge_service.upload_document(
+        tenant_id=context.tenant.tenant_id,
+        user_id=context.user.user_id,
+        kb_id=kb_id,
+        filename=filename,
+        mime_type=mime_type,
+        content=content,
+        parser_mode=parser_mode,
+    )
+
+
+def _ensure_rag_identity(knowledge_service: KnowledgeBaseService, context: AuthContext) -> None:
+    knowledge_service.ensure_identity(
+        tenant_id=context.tenant.tenant_id,
+        tenant_name=context.tenant.name,
+        user_id=context.user.user_id,
+        email=context.user.email,
+        display_name=context.user.display_name,
+    )
+
+
+def _raise_if_postgres_schema_drift(exc: Exception) -> None:
+    if not _is_postgres_schema_drift(exc):
+        return
+    msg = (
+        "PostgreSQL schema is out of date. Re-apply the runtime schema before using knowledge bases: "
+        "`python scripts/bootstrap_runtime.py --skip-rag-index --skip-memory-index`."
+    )
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=msg) from exc
+
+
+def _is_postgres_schema_drift(exc: Exception) -> bool:
+    name = exc.__class__.__name__
+    if name not in {"UndefinedColumn", "UndefinedTable"}:
+        return False
+    text = str(exc)
+    return any(token in text for token in ("rag_", "deepagent_", "checkpoint", "store"))
+
+
+def _parser_mode(value: str | None, *, default: ParserMode) -> ParserMode:
+    if value in (None, ""):
+        return default
+    if value in {"auto", "local", "mcp"}:
+        return cast("ParserMode", value)
+    msg = "`parser_mode` must be one of: auto, local, mcp."
+    raise ValueError(msg)
 
 
 def _raw_api_key(*, authorization: str | None, x_api_key: str | None) -> str | None:

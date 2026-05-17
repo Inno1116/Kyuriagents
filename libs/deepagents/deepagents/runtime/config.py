@@ -80,6 +80,16 @@ class AgentRuntimeConfig:
         enable_tool_audit: Whether tool calls should be audited.
         mcp_config_path: Optional MCP JSON config path.
         mcp_tool_name_prefix: Whether descriptor matching expects server-prefixed MCP tool names.
+        upload_dir: Directory used for user-uploaded source documents.
+        upload_max_bytes: Maximum request body size accepted by document upload endpoints.
+        ingestion_parser_mode: Parser backend used by ingestion workers.
+        ingestion_mcp_config_path: Optional MCP config path used only for document parsing.
+        ingestion_mcp_tool_name: MCP tool name expected to parse one document.
+        ingestion_chunk_chars: Maximum characters per indexed document chunk.
+        ingestion_chunk_overlap: Characters repeated between adjacent chunks.
+        ingestion_embedding_batch_size: Maximum documents sent in one embedding request.
+        ingestion_job_timeout_seconds: Maximum running time before a worker marks
+            an ingestion job as failed. Use `0` to disable stale job cleanup.
     """
 
     tenant_id: str = "default"
@@ -126,6 +136,15 @@ class AgentRuntimeConfig:
     enable_tool_audit: bool = True
     mcp_config_path: str | None = None
     mcp_tool_name_prefix: bool = False
+    upload_dir: str = ".kyuriagents/uploads"
+    upload_max_bytes: int = 25 * 1024 * 1024
+    ingestion_parser_mode: Literal["auto", "local", "mcp"] = "auto"
+    ingestion_mcp_config_path: str | None = None
+    ingestion_mcp_tool_name: str = "parse_document"
+    ingestion_chunk_chars: int = 1_200
+    ingestion_chunk_overlap: int = 180
+    ingestion_embedding_batch_size: int = 10
+    ingestion_job_timeout_seconds: int = 15 * 60
 
     def __post_init__(self) -> None:
         """Validate context window settings."""
@@ -137,6 +156,31 @@ class AgentRuntimeConfig:
             raise ValueError(msg)
         if self.context_summary_trigger_messages > 0 and self.context_summary_trigger_messages <= self.context_summary_keep_messages:
             msg = "`context_summary_trigger_messages` must be greater than `context_summary_keep_messages`."
+            raise ValueError(msg)
+        if self.upload_max_bytes <= 0:
+            msg = "`upload_max_bytes` must be positive."
+            raise ValueError(msg)
+        self._validate_ingestion_config()
+
+    def _validate_ingestion_config(self) -> None:
+        """Validate ingestion-specific runtime settings."""
+        if self.ingestion_parser_mode not in {"auto", "local", "mcp"}:
+            msg = "`ingestion_parser_mode` must be one of: auto, local, mcp."
+            raise ValueError(msg)
+        if self.ingestion_chunk_chars <= 0:
+            msg = "`ingestion_chunk_chars` must be positive."
+            raise ValueError(msg)
+        if self.ingestion_chunk_overlap < 0:
+            msg = "`ingestion_chunk_overlap` must not be negative."
+            raise ValueError(msg)
+        if self.ingestion_chunk_overlap >= self.ingestion_chunk_chars:
+            msg = "`ingestion_chunk_overlap` must be smaller than `ingestion_chunk_chars`."
+            raise ValueError(msg)
+        if self.ingestion_embedding_batch_size <= 0:
+            msg = "`ingestion_embedding_batch_size` must be positive."
+            raise ValueError(msg)
+        if self.ingestion_job_timeout_seconds < 0:
+            msg = "`ingestion_job_timeout_seconds` must not be negative."
             raise ValueError(msg)
 
     @classmethod
@@ -205,6 +249,15 @@ class AgentRuntimeConfig:
             enable_tool_audit=_bool_env(source, "DEEPAGENTS_ENABLE_TOOL_AUDIT", default=True),
             mcp_config_path=_optional_env(source, "DEEPAGENTS_MCP_CONFIG_PATH"),
             mcp_tool_name_prefix=_bool_env(source, "DEEPAGENTS_MCP_TOOL_NAME_PREFIX", default=False),
+            upload_dir=_env(source, "DEEPAGENTS_UPLOAD_DIR", default=".kyuriagents/uploads"),
+            upload_max_bytes=_int_env(source, "DEEPAGENTS_UPLOAD_MAX_BYTES", default=25 * 1024 * 1024),
+            ingestion_parser_mode=_ingestion_parser_mode(_env(source, "DEEPAGENTS_INGESTION_PARSER", default="auto")),
+            ingestion_mcp_config_path=_optional_env(source, "DEEPAGENTS_INGESTION_MCP_CONFIG_PATH"),
+            ingestion_mcp_tool_name=_env(source, "DEEPAGENTS_INGESTION_MCP_TOOL_NAME", default="parse_document"),
+            ingestion_chunk_chars=_int_env(source, "DEEPAGENTS_INGESTION_CHUNK_CHARS", default=1_200),
+            ingestion_chunk_overlap=_int_env(source, "DEEPAGENTS_INGESTION_CHUNK_OVERLAP", default=180),
+            ingestion_embedding_batch_size=_int_env(source, "DEEPAGENTS_INGESTION_EMBEDDING_BATCH_SIZE", default=10),
+            ingestion_job_timeout_seconds=_int_env(source, "DEEPAGENTS_INGESTION_JOB_TIMEOUT_SECONDS", default=15 * 60),
         )
 
     def retrieval_defaults(self) -> RuntimeContextDefaults:
@@ -319,3 +372,10 @@ def _retrieval_mode(value: str) -> RetrievalMode:
         msg = "`RetrievalMode` must be one of: off, auto, tool, hybrid."
         raise ValueError(msg)
     return cast("RetrievalMode", value)
+
+
+def _ingestion_parser_mode(value: str) -> Literal["auto", "local", "mcp"]:
+    if value not in {"auto", "local", "mcp"}:
+        msg = "`DEEPAGENTS_INGESTION_PARSER` must be one of: auto, local, mcp."
+        raise ValueError(msg)
+    return cast("Literal['auto', 'local', 'mcp']", value)

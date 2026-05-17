@@ -44,6 +44,7 @@ runtime = [
     "langchain-openai>=1.1.0,<2.0.0",
     "langgraph-checkpoint-postgres>=3.1.0,<4.0.0",
     "langmem>=0.0.30,<1.0.0",
+    "pypdf>=5.0.0,<7.0.0",
     "pymilvus>=2.4.0,<3.0.0",
 ]
 api = [

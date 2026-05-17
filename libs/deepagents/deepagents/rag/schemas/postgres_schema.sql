@@ -48,9 +48,13 @@ CREATE TABLE IF NOT EXISTS rag_knowledge_bases (
         CHECK (visibility IN ('private', 'team', 'public')),
     status VARCHAR(16) NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'archived', 'disabled')),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS rag_knowledge_bases
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_rag_kb_tenant_visibility
     ON rag_knowledge_bases (tenant_id, visibility, status);
@@ -64,6 +68,9 @@ CREATE TABLE IF NOT EXISTS rag_documents (
     owner_user_id VARCHAR(64) REFERENCES rag_users (user_id),
     source_type VARCHAR(32) NOT NULL,
     source_uri TEXT NOT NULL,
+    file_name VARCHAR(512) NOT NULL DEFAULT '',
+    mime_type VARCHAR(128) NOT NULL DEFAULT '',
+    byte_size BIGINT NOT NULL DEFAULT 0 CHECK (byte_size >= 0),
     title VARCHAR(512) NOT NULL DEFAULT '',
     language VARCHAR(16) NOT NULL DEFAULT 'unknown',
     visibility VARCHAR(16) NOT NULL DEFAULT 'private'
@@ -71,9 +78,22 @@ CREATE TABLE IF NOT EXISTS rag_documents (
     status VARCHAR(16) NOT NULL DEFAULT 'processing'
         CHECK (status IN ('active', 'processing', 'failed', 'archived', 'deleted')),
     latest_version VARCHAR(64),
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS rag_documents
+    ADD COLUMN IF NOT EXISTS file_name VARCHAR(512) NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS rag_documents
+    ADD COLUMN IF NOT EXISTS mime_type VARCHAR(128) NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS rag_documents
+    ADD COLUMN IF NOT EXISTS byte_size BIGINT NOT NULL DEFAULT 0 CHECK (byte_size >= 0);
+ALTER TABLE IF EXISTS rag_documents
+    ADD COLUMN IF NOT EXISTS error_message TEXT;
+ALTER TABLE IF EXISTS rag_documents
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_rag_documents_tenant_kb
     ON rag_documents (tenant_id, kb_id, status);
@@ -171,14 +191,26 @@ CREATE TABLE IF NOT EXISTS rag_ingestion_jobs (
     doc_id VARCHAR(64) REFERENCES rag_documents (doc_id),
     requested_by_user_id VARCHAR(64) REFERENCES rag_users (user_id),
     source_uri TEXT NOT NULL,
+    parser_mode VARCHAR(16) NOT NULL DEFAULT 'auto'
+        CHECK (parser_mode IN ('auto', 'local', 'mcp')),
+    progress INTEGER NOT NULL DEFAULT 0 CHECK (progress >= 0 AND progress <= 100),
     status VARCHAR(16) NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
     error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS rag_ingestion_jobs
+    ADD COLUMN IF NOT EXISTS parser_mode VARCHAR(16) NOT NULL DEFAULT 'auto'
+        CHECK (parser_mode IN ('auto', 'local', 'mcp'));
+ALTER TABLE IF EXISTS rag_ingestion_jobs
+    ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0 CHECK (progress >= 0 AND progress <= 100);
+ALTER TABLE IF EXISTS rag_ingestion_jobs
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_rag_ingestion_jobs_scope
     ON rag_ingestion_jobs (tenant_id, kb_id, status);

@@ -13,6 +13,8 @@ def test_postgres_schema_uses_postgresql_contract() -> None:
     assert "CREATE OR REPLACE FUNCTION rag_touch_updated_at" in schema
     assert "CREATE TABLE IF NOT EXISTS rag_eval_runs" in schema
     assert "CREATE TABLE IF NOT EXISTS rag_eval_results" in schema
+    assert "ALTER TABLE IF EXISTS rag_knowledge_bases" in schema
+    assert "ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb" in schema
     assert "dataset_name VARCHAR(128) NOT NULL" in schema
     assert "recall_at_2 NUMERIC(8,6) NOT NULL DEFAULT 0.0" in schema
     assert "ndcg_at_5 NUMERIC(8,6) NOT NULL DEFAULT 0.0" in schema

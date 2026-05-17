@@ -1,10 +1,15 @@
-from typing import cast
+from collections.abc import Iterator
+from typing import Any, cast
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 
 pytest.importorskip("fastapi")
 
+from fastapi.testclient import TestClient
+
+from deepagents.ingestion import KnowledgeBaseService
+from deepagents.ingestion.store import InMemoryKnowledgeBaseStore
 from deepagents.runtime import AgentRuntimeConfig
 from deepagents.server.app import (
     APIKeyCreateRequest,
@@ -19,14 +24,75 @@ from deepagents.server.identity import AuthContext, InMemoryUserCenter
 
 
 class FakeAgent:
-    def __init__(self) -> None:
+    def __init__(self, *, stream_items: list[object] | None = None) -> None:
         self.input_data: dict[str, object] | None = None
         self.config: dict[str, object] | None = None
+        self.stream_items = stream_items or []
 
     def invoke(self, input_data: dict[str, object], config: dict[str, object] | None = None) -> dict[str, list[AIMessage]]:
         self.input_data = input_data
         self.config = config
         return {"messages": [AIMessage(content="pong")]}
+
+    def stream(
+        self,
+        input_data: dict[str, object],
+        *,
+        config: dict[str, object] | None = None,
+        stream_mode: object | None = None,
+    ) -> Iterator[object]:
+        _ = stream_mode
+        self.input_data = input_data
+        self.config = config
+        yield from self.stream_items
+
+
+class FakeToolChunk:
+    type = "AIMessageChunk"
+    content = "I will search first."
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_calls = [{"name": tool_name}]
+        self.tool_call_chunks: list[dict[str, object]] = []
+
+
+SCHEMA_DRIFT_ERROR = type("UndefinedColumn", (Exception,), {})
+
+
+class SchemaDriftKnowledgeService:
+    """Knowledge service double that simulates an old PostgreSQL schema."""
+
+    def ensure_identity(self, **kwargs: object) -> None:
+        """No-op identity setup for the test double."""
+        _ = kwargs
+
+    def create_knowledge_base(self, **kwargs: object) -> None:
+        """Raise the same class name psycopg uses for missing columns."""
+        _ = kwargs
+        msg = 'column "metadata" of relation "rag_knowledge_bases" does not exist'
+        raise SCHEMA_DRIFT_ERROR(msg)
+
+
+class FakeIndexer:
+    """Indexer double used by knowledge-base API tests."""
+
+    def __init__(self) -> None:
+        """Initialize deletion call tracking."""
+        self.chunks: list[object] = []
+        self.deleted_kbs: list[tuple[str, str]] = []
+        self.deleted_docs: list[tuple[str, str, str]] = []
+
+    def index(self, chunks: list[object]) -> None:
+        """Record indexed chunks."""
+        self.chunks.extend(chunks)
+
+    def delete_knowledge_base(self, *, tenant_id: str, kb_id: str) -> None:
+        """Record knowledge-base deletion."""
+        self.deleted_kbs.append((tenant_id, kb_id))
+
+    def delete_document(self, *, tenant_id: str, kb_id: str, doc_id: str) -> None:
+        """Record document deletion."""
+        self.deleted_docs.append((tenant_id, kb_id, doc_id))
 
 
 def _agent_message_contents(agent: FakeAgent) -> list[str]:
@@ -104,6 +170,70 @@ def test_api_chat_sends_history_when_checkpointer_is_disabled():
     assert _agent_message_contents(agent) == ["old user", "old assistant", "new user"]
 
 
+def test_api_chat_can_disable_rag_per_request():
+    center = InMemoryUserCenter()
+    agent = FakeAgent()
+    configs: list[AgentRuntimeConfig] = []
+
+    def factory(config: AgentRuntimeConfig, **_kwargs: object) -> FakeAgent:
+        configs.append(config)
+        return agent
+
+    app = create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key", rag_mode="tool"),
+        user_center=center,
+        agent_factory=factory,
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    context = _require_context(center.authenticate_api_key(key.raw_key))
+
+    _endpoint(app, "/v1/chat", "POST")(ChatRequest(message="hello", rag_enabled=False), context)
+
+    assert configs[0].rag_mode == "off"
+    assert configs[0].enable_rag is True
+
+
+def test_api_chat_stream_emits_status_delta_and_persists_message():
+    center = InMemoryUserCenter()
+    agent = FakeAgent(
+        stream_items=[
+            ("messages", (FakeToolChunk("search_knowledge_base"), {})),
+            ("updates", {"tools": {"messages": [ToolMessage(content="found it", name="search_knowledge_base", tool_call_id="call-1")]}}),
+            ("messages", (AIMessageChunk(content="po"), {})),
+            ("messages", (AIMessageChunk(content="ng"), {})),
+            ("updates", {"agent": {"messages": [AIMessage(content="pong")]}}),
+        ]
+    )
+    app = create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key"),
+        user_center=center,
+        agent_factory=lambda _config, **_kwargs: agent,
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+
+    response = TestClient(app).post(
+        "/v1/chat/stream",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+        json={"message": "hello", "title": "Streaming test", "rag_enabled": True},
+    )
+
+    assert response.status_code == 200
+    assert "event: message_start" in response.text
+    assert "Searching knowledge base" in response.text
+    assert "I will search first" not in response.text
+    assert 'data: {"text":"po"}' in response.text
+    assert 'data: {"text":"ng"}' in response.text
+    assert '"replace":false' in response.text
+    assert "event: done" in response.text
+    messages = center.list_messages(tenant_id=tenant.tenant_id, thread_id=response.text.split('"thread_id":"')[1].split('"')[0])
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert messages[1].content == "pong"
+
+
 def test_email_password_register_login_issues_bearer_tokens():
     center = InMemoryUserCenter()
     sample = "correct horse"
@@ -130,6 +260,93 @@ def test_email_password_register_login_issues_bearer_tokens():
     login_context = center.authenticate_api_key(login_response.access_token)
     assert login_context is not None
     assert login_context.user.user_id == register_context.user.user_id
+
+
+def test_knowledge_base_upload_queues_document(tmp_path):
+    center = InMemoryUserCenter()
+    indexer = FakeIndexer()
+    knowledge = KnowledgeBaseService(
+        config=AgentRuntimeConfig(api_admin_key="admin-key", upload_dir=str(tmp_path)),
+        store=InMemoryKnowledgeBaseStore(),
+        indexer=cast("Any", indexer),
+    )
+    app = create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key", upload_dir=str(tmp_path)),
+        user_center=center,
+        knowledge_service=knowledge,
+        agent_factory=lambda _config, **_kwargs: FakeAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    client = TestClient(app)
+
+    kb_response = client.post(
+        "/v1/knowledge-bases",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+        json={"name": "PDF KB"},
+    )
+    assert kb_response.status_code == 200
+    kb_id = kb_response.json()["data"]["kb_id"]
+
+    upload_response = client.post(
+        f"/v1/knowledge-bases/{kb_id}/documents?filename=sample.pdf",
+        headers={"Authorization": f"Bearer {key.raw_key}", "Content-Type": "application/pdf"},
+        content=b"%PDF fake content",
+    )
+
+    assert upload_response.status_code == 200
+    data = upload_response.json()["data"]
+    assert data["document"]["status"] == "processing"
+    assert data["job"]["status"] == "queued"
+
+    documents_response = client.get(
+        f"/v1/knowledge-bases/{kb_id}/documents",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+    )
+    assert documents_response.status_code == 200
+    doc_id = documents_response.json()["data"]["documents"][0]["doc_id"]
+    assert documents_response.json()["data"]["documents"][0]["file_name"] == "sample.pdf"
+
+    delete_document_response = client.delete(
+        f"/v1/knowledge-bases/{kb_id}/documents/{doc_id}",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+    )
+    assert delete_document_response.status_code == 200
+    assert delete_document_response.json()["data"]["status"] == "deleted"
+    assert indexer.deleted_docs == [("tenant_1", kb_id, doc_id)]
+
+    delete_kb_response = client.delete(
+        f"/v1/knowledge-bases/{kb_id}",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+    )
+    assert delete_kb_response.status_code == 200
+    assert delete_kb_response.json()["data"]["status"] == "archived"
+    assert indexer.deleted_kbs == [("tenant_1", kb_id)]
+
+
+def test_knowledge_base_schema_drift_returns_actionable_error():
+    center = InMemoryUserCenter()
+    app = create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key"),
+        user_center=center,
+        knowledge_service=cast("Any", SchemaDriftKnowledgeService()),
+        agent_factory=lambda _config, **_kwargs: FakeAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/knowledge-bases",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+        json={"name": "PDF KB"},
+    )
+
+    assert response.status_code == 503
+    assert "PostgreSQL schema is out of date" in response.json()["detail"]
+    assert "bootstrap_runtime.py" in response.json()["detail"]
 
 
 def test_logout_and_revoke_token_disable_bearer_tokens():
@@ -170,6 +387,13 @@ def test_auth_context_is_not_exposed_as_query_parameter():
         ("/v1/threads", "GET"),
         ("/v1/threads", "POST"),
         ("/v1/threads/{thread_id}/messages", "GET"),
+        ("/v1/knowledge-bases", "GET"),
+        ("/v1/knowledge-bases", "POST"),
+        ("/v1/knowledge-bases/{kb_id}", "DELETE"),
+        ("/v1/knowledge-bases/{kb_id}/documents", "GET"),
+        ("/v1/knowledge-bases/{kb_id}/documents", "POST"),
+        ("/v1/knowledge-bases/{kb_id}/documents/{doc_id}", "DELETE"),
+        ("/v1/ingestion/jobs/{job_id}", "GET"),
         ("/v1/chat", "POST"),
     ]:
         route = _route(app, path, method)
