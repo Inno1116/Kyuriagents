@@ -17,9 +17,12 @@ from pydantic import BaseModel, Field
 from deepagents.ingestion import KnowledgeBaseService
 from deepagents.runtime import AgentRuntimeConfig, create_kyuri_agent
 from deepagents.server.identity import AuthContext, DuplicateUserError, MessageRecord, PostgresUserCenter, ThreadRecord, UserCenter
+from deepagents.tasks import TaskRuntime
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
+
+    from deepagents.tasks.types import TaskRecord
 
 
 class _Agent(Protocol):
@@ -144,6 +147,16 @@ class ChatRequest(BaseModel):
     rag_enabled: bool | None = None
 
 
+class TaskCreateRequest(BaseModel):
+    """Request body for starting task mode."""
+
+    goal: str
+    thread_id: str | None = None
+    title: str = ""
+    intent: Literal["chat", "task", "rag_query", "memory_query", "clarify", "unsafe"] | None = "task"
+    rag_enabled: bool | None = None
+
+
 class RecordResponse(BaseModel):
     """Generic JSON response for record-shaped objects."""
 
@@ -179,6 +192,7 @@ def create_app(
     config: AgentRuntimeConfig | None = None,
     user_center: UserCenter | None = None,
     knowledge_service: KnowledgeBaseService | None = None,
+    task_runtime: TaskRuntime | None = None,
     agent_factory: Callable[..., object] | None = None,
 ) -> FastAPI:
     """Create the FastAPI application.
@@ -187,6 +201,7 @@ def create_app(
         config: Runtime configuration. Defaults to `AgentRuntimeConfig.from_env()`.
         user_center: Optional user center store. Defaults to PostgreSQL.
         knowledge_service: Optional knowledge-base ingestion service.
+        task_runtime: Optional task-mode runtime.
         agent_factory: Optional agent factory for tests.
 
     Returns:
@@ -198,6 +213,7 @@ def create_app(
     resolved_config = config or AgentRuntimeConfig.from_env()
     resolved_center = user_center or _postgres_user_center(resolved_config)
     resolved_knowledge = knowledge_service or KnowledgeBaseService(config=resolved_config)
+    resolved_tasks = task_runtime or TaskRuntime.from_config(resolved_config)
     resolved_agent_factory = agent_factory or create_kyuri_agent
     app = FastAPI(title="Deep Agents API", version="0.1.0")
     _configure_cors(app, resolved_config)
@@ -208,6 +224,7 @@ def create_app(
         config=resolved_config,
         user_center=resolved_center,
         knowledge_service=resolved_knowledge,
+        task_runtime=resolved_tasks,
         agent_factory=resolved_agent_factory,
     )
     return app
@@ -313,12 +330,14 @@ def _register_user_routes(
     config: AgentRuntimeConfig,
     user_center: UserCenter,
     knowledge_service: KnowledgeBaseService,
+    task_runtime: TaskRuntime,
     agent_factory: Callable[..., object],
 ) -> None:
     """Register authenticated user and chat routes."""
     require_auth = _make_auth_dependency(user_center)
     _register_user_metadata_routes(app=app, user_center=user_center, require_auth=require_auth)
     _register_knowledge_routes(app=app, config=config, knowledge_service=knowledge_service, require_auth=require_auth)
+    _register_task_routes(app=app, user_center=user_center, task_runtime=task_runtime, require_auth=require_auth)
     _register_chat_route(app=app, config=config, user_center=user_center, agent_factory=agent_factory, require_auth=require_auth)
 
 
@@ -502,6 +521,84 @@ def _register_knowledge_routes(
         if job is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ingestion job not found.")
         return RecordResponse(data=_record_dict(job))
+
+
+def _register_task_routes(
+    *,
+    app: FastAPI,
+    user_center: UserCenter,
+    task_runtime: TaskRuntime,
+    require_auth: Callable[..., AuthContext],
+) -> None:
+    """Register task-mode planning and execution routes."""
+    auth_dependency = cast("AuthContext", Depends(require_auth))
+
+    @app.post("/v1/tasks", response_model=RecordResponse)
+    def create_task(request: TaskCreateRequest, context: AuthContext = auth_dependency) -> RecordResponse:
+        try:
+            chat_request = ChatRequest(message=request.goal, thread_id=request.thread_id, title=request.title)
+            thread = _resolve_thread(user_center, context=context, request=chat_request)
+        except ThreadNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.") from exc
+        history = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=thread.thread_id, limit=100)
+        user_center.append_message(
+            tenant_id=context.tenant.tenant_id,
+            thread_id=thread.thread_id,
+            user_id=context.user.user_id,
+            role="user",
+            content=request.goal,
+            metadata={"task_mode": True},
+        )
+        result = task_runtime.run(
+            tenant_id=context.tenant.tenant_id,
+            user_id=context.user.user_id,
+            thread_id=thread.thread_id,
+            goal=request.goal,
+            title=request.title,
+            messages=history,
+            forced_intent=request.intent,
+            disabled_tools=("search_knowledge_base",) if request.rag_enabled is False else (),
+        )
+        if result.final_answer:
+            user_center.append_message(
+                tenant_id=context.tenant.tenant_id,
+                thread_id=thread.thread_id,
+                user_id=context.user.user_id,
+                role="assistant",
+                content=result.final_answer,
+                metadata={"task_id": result.task.task_id, "task_mode": True},
+            )
+        return RecordResponse(data=_task_payload(result))
+
+    @app.get("/v1/tasks", response_model=RecordResponse)
+    def list_tasks(context: AuthContext = auth_dependency, limit: int = 50) -> RecordResponse:
+        tasks = task_runtime.store.list_tasks(tenant_id=context.tenant.tenant_id, user_id=context.user.user_id, limit=limit)
+        return RecordResponse(data={"tasks": [_record_dict(task) for task in tasks]})
+
+    @app.get("/v1/tasks/{task_id}", response_model=RecordResponse)
+    def get_task(task_id: str, context: AuthContext = auth_dependency) -> RecordResponse:
+        task = _task_or_404(task_runtime, context=context, task_id=task_id)
+        return RecordResponse(
+            data={
+                "task": _record_dict(task),
+                "steps": [_record_dict(step) for step in task_runtime.store.list_steps(task_id=task.task_id)],
+                "events": [_record_dict(event) for event in task_runtime.store.list_events(task_id=task.task_id)],
+            }
+        )
+
+    @app.get("/v1/tasks/{task_id}/events", response_model=RecordResponse)
+    def list_task_events(task_id: str, context: AuthContext = auth_dependency, limit: int = 200) -> RecordResponse:
+        task = _task_or_404(task_runtime, context=context, task_id=task_id)
+        return RecordResponse(data={"events": [_record_dict(event) for event in task_runtime.store.list_events(task_id=task.task_id, limit=limit)]})
+
+    @app.post("/v1/tasks/{task_id}/cancel", response_model=RecordResponse)
+    def cancel_task(task_id: str, context: AuthContext = auth_dependency) -> RecordResponse:
+        task = _task_or_404(task_runtime, context=context, task_id=task_id)
+        if task.status in {"succeeded", "failed", "cancelled"}:
+            return RecordResponse(data=_record_dict(task))
+        cancelled = task_runtime.store.update_task(task.task_id, status="cancelled", finished=True)
+        task_runtime.store.add_event(task_id=task.task_id, event_type="cancelled", message="Task cancelled.")
+        return RecordResponse(data=_record_dict(cancelled))
 
 
 def _register_chat_route(
@@ -1045,6 +1142,23 @@ def _assistant_text(result: Mapping[str, object]) -> str:
             content = getattr(message, "content", "")
             return str(content)
     return ""
+
+
+def _task_or_404(task_runtime: TaskRuntime, *, context: AuthContext, task_id: str) -> TaskRecord:
+    task = task_runtime.store.get_task(tenant_id=context.tenant.tenant_id, user_id=context.user.user_id, task_id=task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+    return task
+
+
+def _task_payload(result: object) -> dict[str, object]:
+    payload = cast("Any", result)
+    return {
+        "task": _record_dict(payload.task),
+        "steps": [_record_dict(step) for step in payload.steps],
+        "events": [_record_dict(event) for event in payload.events],
+        "final_answer": str(payload.final_answer),
+    }
 
 
 def _record_dict(record: object) -> dict[str, object]:

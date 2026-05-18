@@ -16,11 +16,13 @@ from deepagents.server.app import (
     ChatRequest,
     LoginRequest,
     RegisterRequest,
+    TaskCreateRequest,
     TenantCreateRequest,
     UserCreateRequest,
     create_app,
 )
 from deepagents.server.identity import AuthContext, InMemoryUserCenter
+from deepagents.tasks import InMemoryTaskStore, TaskRuntime
 
 
 class FakeAgent:
@@ -193,6 +195,39 @@ def test_api_chat_can_disable_rag_per_request():
 
     assert configs[0].rag_mode == "off"
     assert configs[0].enable_rag is True
+
+
+def test_api_task_flow_creates_task_steps_and_messages() -> None:
+    center = InMemoryUserCenter()
+    runtime = TaskRuntime(store=InMemoryTaskStore())
+    app = create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key"),
+        user_center=center,
+        task_runtime=runtime,
+        agent_factory=lambda _config, **_kwargs: FakeAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    context = _require_context(center.authenticate_api_key(key.raw_key))
+
+    response = _endpoint(app, "/v1/tasks", "POST")(
+        TaskCreateRequest(goal="summarize the uploaded document", title="Task test"),
+        context,
+    )
+
+    task = cast("dict[str, object]", response.data["task"])
+    steps = cast("list[dict[str, object]]", response.data["steps"])
+    events = cast("list[dict[str, object]]", response.data["events"])
+    assert task["status"] == "succeeded"
+    assert task["title"] == "Task test"
+    assert [step["kind"] for step in steps] == ["think", "answer"]
+    assert events[-1]["event_type"] == "finished"
+    thread_id = cast("str", task["thread_id"])
+    messages = center.list_messages(tenant_id=tenant.tenant_id, thread_id=thread_id)
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert messages[0].metadata == {"task_mode": True}
+    assert messages[1].metadata == {"task_id": task["task_id"], "task_mode": True}
 
 
 def test_api_chat_stream_emits_status_delta_and_persists_message():
@@ -394,6 +429,11 @@ def test_auth_context_is_not_exposed_as_query_parameter():
         ("/v1/knowledge-bases/{kb_id}/documents", "POST"),
         ("/v1/knowledge-bases/{kb_id}/documents/{doc_id}", "DELETE"),
         ("/v1/ingestion/jobs/{job_id}", "GET"),
+        ("/v1/tasks", "GET"),
+        ("/v1/tasks", "POST"),
+        ("/v1/tasks/{task_id}", "GET"),
+        ("/v1/tasks/{task_id}/events", "GET"),
+        ("/v1/tasks/{task_id}/cancel", "POST"),
         ("/v1/chat", "POST"),
     ]:
         route = _route(app, path, method)

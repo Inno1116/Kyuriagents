@@ -79,3 +79,73 @@ ALTER TABLE IF EXISTS agent_messages
 
 CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_message_seq_uidx ON agent_messages(message_seq);
 CREATE INDEX IF NOT EXISTS agent_messages_thread_seq_idx ON agent_messages(tenant_id, thread_id, message_seq ASC);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    task_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES agent_tenants(tenant_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES agent_users(user_id) ON DELETE CASCADE,
+    thread_id TEXT NOT NULL REFERENCES agent_threads(thread_id) ON DELETE CASCADE,
+    goal TEXT NOT NULL,
+    intent TEXT NOT NULL DEFAULT 'task'
+        CHECK (intent IN ('chat', 'task', 'rag_query', 'memory_query', 'clarify', 'unsafe')),
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'planning', 'running', 'waiting_user', 'succeeded', 'failed', 'cancelled')),
+    title TEXT NOT NULL DEFAULT '',
+    final_answer TEXT NOT NULL DEFAULT '',
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS agent_tasks_user_created_idx
+    ON agent_tasks(tenant_id, user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS agent_tasks_thread_created_idx
+    ON agent_tasks(tenant_id, thread_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS agent_tasks_status_idx
+    ON agent_tasks(tenant_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_task_steps (
+    step_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES agent_tasks(task_id) ON DELETE CASCADE,
+    step_index INTEGER NOT NULL CHECK (step_index >= 0),
+    kind TEXT NOT NULL CHECK (kind IN ('think', 'tool', 'answer')),
+    title TEXT NOT NULL DEFAULT '',
+    instruction TEXT NOT NULL DEFAULT '',
+    tool_name TEXT NOT NULL DEFAULT '',
+    input JSONB NOT NULL DEFAULT '{}'::jsonb,
+    depends_on JSONB NOT NULL DEFAULT '[]'::jsonb,
+    parallel_group TEXT NOT NULL DEFAULT '',
+    risk TEXT NOT NULL DEFAULT 'read_only'
+        CHECK (risk IN ('read_only', 'external_read', 'write', 'destructive', 'network')),
+    requires_confirmation BOOLEAN NOT NULL DEFAULT false,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'cancelled')),
+    output TEXT NOT NULL DEFAULT '',
+    error_message TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    UNIQUE (task_id, step_index)
+);
+
+CREATE INDEX IF NOT EXISTS agent_task_steps_task_idx
+    ON agent_task_steps(task_id, step_index);
+CREATE INDEX IF NOT EXISTS agent_task_steps_tool_idx
+    ON agent_task_steps(tool_name, status);
+
+CREATE TABLE IF NOT EXISTS agent_task_events (
+    event_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES agent_tasks(task_id) ON DELETE CASCADE,
+    step_id TEXT REFERENCES agent_task_steps(step_id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS agent_task_events_task_created_idx
+    ON agent_task_events(task_id, created_at ASC);
