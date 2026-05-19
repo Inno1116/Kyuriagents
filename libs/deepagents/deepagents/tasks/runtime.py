@@ -522,16 +522,37 @@ class TaskRuntime:
         """Run a task synchronously through the full planning loop."""
         task = self.store.create_task(tenant_id=tenant_id, user_id=user_id, thread_id=thread_id, goal=goal, title=title, intent="task")
         self.store.add_event(task_id=task.task_id, event_type="created", message="Task created.")
+        return self.run_existing_task(task=task, messages=messages, forced_intent=forced_intent, disabled_tools=disabled_tools)
+
+    def run_existing_task(
+        self,
+        *,
+        task: TaskRecord,
+        messages: Sequence[MessageRecord] = (),
+        forced_intent: TaskIntent | None = "task",
+        disabled_tools: Sequence[str] = (),
+    ) -> TaskRunResult:
+        """Run a previously created task through the planning loop.
+
+        Args:
+            task: Persisted task record that already has a `created` event.
+            messages: Recent conversation messages used by the context builder.
+            forced_intent: Optional intent override from the API layer.
+            disabled_tools: Tool names hidden from the planner and executor.
+
+        Returns:
+            Final task run state, including steps, events, and final answer.
+        """
         try:
-            intent = self._router.route(goal, forced_intent=forced_intent)
+            intent = self._router.route(task.goal, forced_intent=forced_intent)
             task = self.store.update_task(task.task_id, status="planning", intent=intent)
             self.store.add_event(task_id=task.task_id, event_type="intent", message=f"Intent routed as {intent}.")
             context = self._context_builder.build(
-                goal=goal,
+                goal=task.goal,
                 intent=intent,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                thread_id=thread_id,
+                tenant_id=task.tenant_id,
+                user_id=task.user_id,
+                thread_id=task.thread_id,
                 messages=messages,
                 tool_descriptors=_filter_descriptors(self._executor.tool_descriptors, disabled_tools=disabled_tools),
                 constraints={"max_steps": self._limits.max_plan_steps, "max_tool_calls": self._limits.max_tool_calls},
@@ -549,7 +570,13 @@ class TaskRuntime:
             self.store.add_event(task_id=task.task_id, event_type="validated", message="Plan validated.")
             task = self.store.update_task(task.task_id, status="running")
             final_answer = self._run_steps(
-                task=task, context=context, tenant_id=tenant_id, user_id=user_id, thread_id=thread_id, goal=goal, steps=steps
+                task=task,
+                context=context,
+                tenant_id=task.tenant_id,
+                user_id=task.user_id,
+                thread_id=task.thread_id,
+                goal=task.goal,
+                steps=steps,
             )
             task = self.store.update_task(task.task_id, status="succeeded", final_answer=final_answer, finished=True)
             self.store.add_event(task_id=task.task_id, event_type="finished", message="Task completed.")

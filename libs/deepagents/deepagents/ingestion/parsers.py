@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import import_module
 from typing import TYPE_CHECKING, Protocol, cast
+from xml.etree import ElementTree as ET
 
 from deepagents.runtime.mcp import load_mcp_tools
 from deepagents.tools.registry import tool_name
@@ -84,6 +86,76 @@ class _InvokableTool(Protocol):
         ...
 
 
+class LocalPlainTextParser:
+    """Extract text from plain text documents."""
+
+    name = "local_plain_text"
+    version = "local_plain_text:v1"
+
+    def supports(self, request: ParseRequest) -> bool:
+        """Return whether the file looks like a plain text document."""
+        suffix = request.filename.lower()
+        return request.mime_type.startswith("text/") or suffix.endswith((".txt", ".text"))
+
+    def parse(self, request: ParseRequest) -> ParsedDocument:
+        """Decode a plain text document.
+
+        Args:
+            request: Source document request.
+
+        Returns:
+            Parsed document with one section containing the decoded text.
+
+        Raises:
+            ValueError: If the file is empty or cannot be decoded.
+        """
+        text, encoding = _decode_text(request.file_path.read_bytes())
+        text = _normalize_text(text).strip()
+        if not text:
+            msg = "No text was found in the plain text document."
+            raise ValueError(msg)
+        return ParsedDocument(title=request.filename, sections=(ParsedSection(text=text),), metadata={"encoding": encoding})
+
+
+class LocalDocxTextParser:
+    """Extract text from modern Word `.docx` documents."""
+
+    name = "local_docx_text"
+    version = "local_docx_text:v1"
+
+    def supports(self, request: ParseRequest) -> bool:
+        """Return whether the file looks like a Word `.docx` document."""
+        return (
+            request.mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            or request.filename.lower().endswith(".docx")
+        )
+
+    def parse(self, request: ParseRequest) -> ParsedDocument:
+        """Extract paragraph text from a Word `.docx` file.
+
+        Args:
+            request: Source document request.
+
+        Returns:
+            Parsed document with one section per non-empty paragraph.
+
+        Raises:
+            ValueError: If the file is not a readable `.docx` or contains no text.
+        """
+        try:
+            with zipfile.ZipFile(request.file_path) as archive:
+                document_xml = archive.read("word/document.xml")
+                title = _docx_title(archive, fallback=request.filename)
+        except (KeyError, zipfile.BadZipFile) as exc:
+            msg = "The Word document could not be read. Local parsing supports `.docx` files only."
+            raise ValueError(msg) from exc
+        sections = _docx_sections(document_xml)
+        if not sections:
+            msg = "No extractable text was found in the Word document."
+            raise ValueError(msg)
+        return ParsedDocument(title=title, sections=sections, metadata={"paragraph_count": len(sections)})
+
+
 class LocalPdfTextParser:
     """Extract text from ordinary text PDFs using `pypdf`."""
 
@@ -124,6 +196,33 @@ class LocalPdfTextParser:
             raise ValueError(msg)
         title = _title_from_metadata(reader.metadata, fallback=request.filename)
         return ParsedDocument(title=title, sections=tuple(sections), metadata={"page_count": len(reader.pages)})
+
+
+class LocalDocumentParser:
+    """Parse locally supported document formats."""
+
+    name = "local_document_parser"
+    version = "local_document_parser:v1"
+
+    def __init__(self, parsers: Sequence[DocumentParser] | None = None) -> None:
+        """Initialize the composite local parser.
+
+        Args:
+            parsers: Optional parser sequence for tests or customization.
+        """
+        self._parsers = tuple(parsers or (LocalPdfTextParser(), LocalDocxTextParser(), LocalPlainTextParser()))
+
+    def supports(self, request: ParseRequest) -> bool:
+        """Return whether any local parser supports the request."""
+        return any(parser.supports(request) for parser in self._parsers)
+
+    def parse(self, request: ParseRequest) -> ParsedDocument:
+        """Parse a document with the first matching local parser."""
+        for parser in self._parsers:
+            if parser.supports(request):
+                return parser.parse(request)
+        msg = "Local parser supports PDF, DOCX, and TXT documents."
+        raise ValueError(msg)
 
 
 class MCPDocumentParser:
@@ -235,7 +334,7 @@ def build_document_parser(config: AgentRuntimeConfig) -> DocumentParser:
     Returns:
         Parser selected by `DEEPAGENTS_INGESTION_PARSER`.
     """
-    local = LocalPdfTextParser()
+    local = LocalDocumentParser()
     if config.ingestion_parser_mode == "local":
         return local
 
@@ -333,6 +432,66 @@ def _sections_from_payload(payload: Mapping[str, object]) -> tuple[ParsedSection
             )
         )
     return tuple(sections)
+
+
+def _decode_text(data: bytes) -> tuple[str, str]:
+    for encoding in ("utf-8-sig", "utf-16", "gb18030", "cp1252"):
+        try:
+            return data.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    msg = "Plain text document could not be decoded with supported encodings."
+    raise ValueError(msg)
+
+
+def _normalize_text(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+_WORD_NAMESPACE = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_DUBLIN_CORE_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
+
+
+def _docx_sections(document_xml: bytes) -> tuple[ParsedSection, ...]:
+    root = _safe_xml_fromstring(document_xml)
+    sections: list[ParsedSection] = []
+    for paragraph in root.iter(f"{_WORD_NAMESPACE}p"):
+        text = _docx_paragraph_text(paragraph).strip()
+        if text:
+            sections.append(ParsedSection(text=text))
+    return tuple(sections)
+
+
+def _docx_paragraph_text(paragraph: ET.Element) -> str:
+    parts: list[str] = []
+    for node in paragraph.iter():
+        if node.tag == f"{_WORD_NAMESPACE}t":
+            parts.append(node.text or "")
+        elif node.tag == f"{_WORD_NAMESPACE}tab":
+            parts.append("\t")
+        elif node.tag == f"{_WORD_NAMESPACE}br":
+            parts.append("\n")
+    return "".join(parts)
+
+
+def _docx_title(archive: zipfile.ZipFile, *, fallback: str) -> str:
+    try:
+        core_xml = archive.read("docProps/core.xml")
+    except KeyError:
+        return fallback
+    root = _safe_xml_fromstring(core_xml)
+    title = root.findtext(f"{_DUBLIN_CORE_NAMESPACE}title")
+    if title and title.strip():
+        return title.strip()
+    return fallback
+
+
+def _safe_xml_fromstring(data: bytes) -> ET.Element:
+    lowered = data.lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        msg = "DOCX XML with DTD or entity declarations is not supported."
+        raise ValueError(msg)
+    return ET.fromstring(data)  # noqa: S314  # DOCX XML is pre-screened above and external entities are rejected.
 
 
 def _title_from_metadata(metadata: object, *, fallback: str) -> str:

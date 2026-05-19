@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -22,7 +24,11 @@ from deepagents.tasks import TaskRuntime
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
-    from deepagents.tasks.types import TaskRecord
+    from deepagents.tasks.types import TaskEventRecord, TaskRecord, TaskStepRecord
+
+
+_TASK_STREAM_POLL_SECONDS = 0.2
+_TASK_STREAM_EVENT_LIMIT = 500
 
 
 class _Agent(Protocol):
@@ -57,6 +63,15 @@ class _StreamState:
     initial_model_pending: bool = True
     tool_finished: bool = False
     tool_started: bool = False
+
+
+@dataclass
+class _TaskWorkerState:
+    """Mutable state shared by the task stream worker and SSE loop."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    result: object | None = None
+    error: BaseException | None = None
 
 
 _MIN_PASSWORD_LENGTH = 8
@@ -402,6 +417,17 @@ def _register_user_metadata_routes(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Token not found.")
         return RecordResponse(data={"revoked": True, "key_id": key_id})
 
+    _register_thread_routes(app=app, user_center=user_center, auth_dependency=auth_dependency)
+
+
+def _register_thread_routes(
+    *,
+    app: FastAPI,
+    user_center: UserCenter,
+    auth_dependency: AuthContext,
+) -> None:
+    """Register authenticated thread and message metadata routes."""
+
     @app.post("/v1/threads", response_model=RecordResponse)
     def create_thread(request: ThreadCreateRequest, context: AuthContext = auth_dependency) -> RecordResponse:
         thread = user_center.create_thread(
@@ -426,6 +452,13 @@ def _register_user_metadata_routes(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.") from exc
         messages = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=thread.thread_id, limit=limit)
         return RecordResponse(data={"messages": [_record_dict(message) for message in messages]})
+
+    @app.delete("/v1/threads/{thread_id}", response_model=RecordResponse)
+    def delete_thread(thread_id: str, context: AuthContext = auth_dependency) -> RecordResponse:
+        deleted = user_center.delete_thread(tenant_id=context.tenant.tenant_id, user_id=context.user.user_id, thread_id=thread_id)
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.")
+        return RecordResponse(data={"deleted": True, "thread_id": thread_id})
 
 
 def _register_knowledge_routes(
@@ -570,6 +603,8 @@ def _register_task_routes(
             )
         return RecordResponse(data=_task_payload(result))
 
+    _register_task_stream_route(app=app, user_center=user_center, task_runtime=task_runtime, auth_dependency=auth_dependency)
+
     @app.get("/v1/tasks", response_model=RecordResponse)
     def list_tasks(context: AuthContext = auth_dependency, limit: int = 50) -> RecordResponse:
         tasks = task_runtime.store.list_tasks(tenant_id=context.tenant.tenant_id, user_id=context.user.user_id, limit=limit)
@@ -599,6 +634,55 @@ def _register_task_routes(
         cancelled = task_runtime.store.update_task(task.task_id, status="cancelled", finished=True)
         task_runtime.store.add_event(task_id=task.task_id, event_type="cancelled", message="Task cancelled.")
         return RecordResponse(data=_record_dict(cancelled))
+
+
+def _register_task_stream_route(
+    *,
+    app: FastAPI,
+    user_center: UserCenter,
+    task_runtime: TaskRuntime,
+    auth_dependency: AuthContext,
+) -> None:
+    """Register the streaming task endpoint."""
+
+    @app.post("/v1/tasks/stream")
+    def create_task_stream(request: TaskCreateRequest, context: AuthContext = auth_dependency) -> StreamingResponse:
+        try:
+            chat_request = ChatRequest(message=request.goal, thread_id=request.thread_id, title=request.title)
+            thread = _resolve_thread(user_center, context=context, request=chat_request)
+        except ThreadNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.") from exc
+        history = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=thread.thread_id, limit=100)
+        user_center.append_message(
+            tenant_id=context.tenant.tenant_id,
+            thread_id=thread.thread_id,
+            user_id=context.user.user_id,
+            role="user",
+            content=request.goal,
+            metadata={"task_mode": True},
+        )
+        task = task_runtime.store.create_task(
+            tenant_id=context.tenant.tenant_id,
+            user_id=context.user.user_id,
+            thread_id=thread.thread_id,
+            goal=request.goal,
+            title=request.title,
+            intent="task",
+        )
+        task_runtime.store.add_event(task_id=task.task_id, event_type="created", message="Task created.")
+        return StreamingResponse(
+            _task_event_source(
+                user_center=user_center,
+                task_runtime=task_runtime,
+                context=context,
+                task=task,
+                messages=history,
+                forced_intent=request.intent,
+                disabled_tools=("search_knowledge_base",) if request.rag_enabled is False else (),
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
 
 def _register_chat_route(
@@ -761,6 +845,116 @@ def _chat_event_source(
         )
     except Exception as exc:  # noqa: BLE001  # Streaming endpoints must send errors after headers are committed.
         yield _sse("error", {"detail": str(exc)})
+
+
+def _task_event_source(
+    *,
+    user_center: UserCenter,
+    task_runtime: TaskRuntime,
+    context: AuthContext,
+    task: TaskRecord,
+    messages: Sequence[MessageRecord],
+    forced_intent: Literal["chat", "task", "rag_query", "memory_query", "clarify", "unsafe"] | None,
+    disabled_tools: Sequence[str],
+) -> Iterator[str]:
+    state = _TaskWorkerState()
+
+    def run_task() -> None:
+        try:
+            state.result = task_runtime.run_existing_task(
+                task=task,
+                messages=messages,
+                forced_intent=forced_intent,
+                disabled_tools=disabled_tools,
+            )
+        except BaseException as exc:  # noqa: BLE001  # worker failures must be reported through SSE after headers are sent.
+            state.error = exc
+        finally:
+            state.done.set()
+
+    threading.Thread(target=run_task, daemon=True).start()
+    seen_event_ids: set[str] = set()
+    last_snapshot = ""
+    yield _sse("task_start", _task_snapshot_payload(task_runtime=task_runtime, task=task))
+    while not state.done.is_set():
+        last_snapshot = yield from _task_progress_events(
+            task_runtime=task_runtime,
+            task=task,
+            seen_event_ids=seen_event_ids,
+            last_snapshot=last_snapshot,
+        )
+        time.sleep(_TASK_STREAM_POLL_SECONDS)
+    last_snapshot = yield from _task_progress_events(
+        task_runtime=task_runtime,
+        task=task,
+        seen_event_ids=seen_event_ids,
+        last_snapshot=last_snapshot,
+    )
+    if state.error is not None:
+        yield _sse("error", {"detail": str(state.error)})
+        return
+    result = state.result
+    if result is None:
+        yield _sse("error", {"detail": "Task finished without a result."})
+        return
+    payload = _task_payload(result)
+    payload["thread_id"] = task.thread_id
+    final_answer = str(payload.get("final_answer") or "")
+    if final_answer:
+        assistant_message = user_center.append_message(
+            tenant_id=context.tenant.tenant_id,
+            thread_id=task.thread_id,
+            user_id=context.user.user_id,
+            role="assistant",
+            content=final_answer,
+            metadata={"task_id": task.task_id, "task_mode": True},
+        )
+        payload["message_id"] = assistant_message.message_id
+    yield _sse("done", payload)
+
+
+def _task_progress_events(
+    *,
+    task_runtime: TaskRuntime,
+    task: TaskRecord,
+    seen_event_ids: set[str],
+    last_snapshot: str,
+) -> Iterator[str]:
+    latest_task, steps, events = _task_stream_records(task_runtime=task_runtime, task=task)
+    for event in events:
+        if event.event_id in seen_event_ids:
+            continue
+        seen_event_ids.add(event.event_id)
+        yield _sse("task_event", {"event": _record_dict(event)})
+    payload = _task_snapshot_payload(task_runtime=task_runtime, task=latest_task, steps=steps, events=events)
+    snapshot = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if snapshot != last_snapshot:
+        yield _sse("task_snapshot", payload)
+        return snapshot
+    return last_snapshot
+
+
+def _task_snapshot_payload(
+    *,
+    task_runtime: TaskRuntime,
+    task: TaskRecord,
+    steps: Sequence[TaskStepRecord] | None = None,
+    events: Sequence[TaskEventRecord] | None = None,
+) -> dict[str, object]:
+    resolved_steps = list(steps) if steps is not None else task_runtime.store.list_steps(task_id=task.task_id)
+    resolved_events = list(events) if events is not None else task_runtime.store.list_events(task_id=task.task_id, limit=_TASK_STREAM_EVENT_LIMIT)
+    return {
+        "task": _record_dict(task),
+        "steps": [_record_dict(step) for step in resolved_steps],
+        "events": [_record_dict(event) for event in resolved_events],
+    }
+
+
+def _task_stream_records(*, task_runtime: TaskRuntime, task: TaskRecord) -> tuple[TaskRecord, list[TaskStepRecord], list[TaskEventRecord]]:
+    latest_task = task_runtime.store.get_task(tenant_id=task.tenant_id, user_id=task.user_id, task_id=task.task_id) or task
+    steps = task_runtime.store.list_steps(task_id=task.task_id)
+    events = task_runtime.store.list_events(task_id=task.task_id, limit=_TASK_STREAM_EVENT_LIMIT)
+    return latest_task, steps, events
 
 
 def _stream_item_parts(item: object) -> tuple[str, object]:

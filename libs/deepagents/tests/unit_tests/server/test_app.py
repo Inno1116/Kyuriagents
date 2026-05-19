@@ -151,6 +151,26 @@ def test_api_chat_flow_creates_authenticated_thread_messages():
     assert _agent_message_contents(agent) == ["hello"]
 
 
+def test_api_thread_delete_hides_thread_from_recent_list() -> None:
+    center = InMemoryUserCenter()
+    app = create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key"),
+        user_center=center,
+        agent_factory=lambda _config, **_kwargs: FakeAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    context = _require_context(center.authenticate_api_key(key.raw_key))
+    thread = center.create_thread(tenant_id=tenant.tenant_id, user_id=user.user_id, title="Remove me")
+
+    response = _endpoint(app, "/v1/threads/{thread_id}", "DELETE")(thread.thread_id, context)
+
+    assert response.data == {"deleted": True, "thread_id": thread.thread_id}
+    assert center.list_threads(tenant_id=tenant.tenant_id, user_id=user.user_id) == []
+    assert center.get_thread(tenant_id=tenant.tenant_id, user_id=user.user_id, thread_id=thread.thread_id) is None
+
+
 def test_api_chat_sends_history_when_checkpointer_is_disabled():
     center = InMemoryUserCenter()
     agent = FakeAgent()
@@ -228,6 +248,37 @@ def test_api_task_flow_creates_task_steps_and_messages() -> None:
     assert [message.role for message in messages] == ["user", "assistant"]
     assert messages[0].metadata == {"task_mode": True}
     assert messages[1].metadata == {"task_id": task["task_id"], "task_mode": True}
+
+
+def test_api_task_stream_emits_progress_and_persists_messages() -> None:
+    center = InMemoryUserCenter()
+    runtime = TaskRuntime(store=InMemoryTaskStore())
+    app = create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key"),
+        user_center=center,
+        task_runtime=runtime,
+        agent_factory=lambda _config, **_kwargs: FakeAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+
+    response = TestClient(app).post(
+        "/v1/tasks/stream",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+        json={"goal": "summarize the uploaded document", "title": "Task stream test"},
+    )
+
+    assert response.status_code == 200
+    assert "event: task_start" in response.text
+    assert "event: task_event" in response.text
+    assert "event: task_snapshot" in response.text
+    assert "event: done" in response.text
+    tasks = runtime.store.list_tasks(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    assert len(tasks) == 1
+    messages = center.list_messages(tenant_id=tenant.tenant_id, thread_id=tasks[0].thread_id)
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert messages[1].metadata == {"task_id": tasks[0].task_id, "task_mode": True}
 
 
 def test_api_chat_stream_emits_status_delta_and_persists_message():
@@ -421,6 +472,7 @@ def test_auth_context_is_not_exposed_as_query_parameter():
         ("/v1/auth/tokens/{key_id}/revoke", "POST"),
         ("/v1/threads", "GET"),
         ("/v1/threads", "POST"),
+        ("/v1/threads/{thread_id}", "DELETE"),
         ("/v1/threads/{thread_id}/messages", "GET"),
         ("/v1/knowledge-bases", "GET"),
         ("/v1/knowledge-bases", "POST"),
@@ -431,6 +483,7 @@ def test_auth_context_is_not_exposed_as_query_parameter():
         ("/v1/ingestion/jobs/{job_id}", "GET"),
         ("/v1/tasks", "GET"),
         ("/v1/tasks", "POST"),
+        ("/v1/tasks/stream", "POST"),
         ("/v1/tasks/{task_id}", "GET"),
         ("/v1/tasks/{task_id}/events", "GET"),
         ("/v1/tasks/{task_id}/cancel", "POST"),

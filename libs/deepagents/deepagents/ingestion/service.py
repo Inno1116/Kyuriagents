@@ -31,7 +31,8 @@ if TYPE_CHECKING:
     from deepagents.runtime import AgentRuntimeConfig
 
 _CHUNKER_VERSION = "fixed_char_window:v1"
-_SOURCE_TYPE_BY_MIME = {"application/pdf": "pdf"}
+_DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_SOURCE_TYPE_BY_MIME = {"application/pdf": "pdf", _DOCX_MIME_TYPE: "docx", "text/plain": "txt"}
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _MIN_KEYWORD_LENGTH = 3
 
@@ -436,16 +437,26 @@ def _normalize_mime_type(mime_type: str, *, filename: str) -> str:
 
 
 def _mime_from_suffix(filename: str) -> str:
-    if filename.lower().endswith(".pdf"):
+    suffix = filename.lower()
+    if suffix.endswith(".pdf"):
         return "application/pdf"
+    if suffix.endswith(".docx"):
+        return _DOCX_MIME_TYPE
+    if suffix.endswith((".txt", ".text")):
+        return "text/plain"
     return "application/octet-stream"
 
 
 def _source_type(mime_type: str, *, filename: str) -> str:
     if mime_type in _SOURCE_TYPE_BY_MIME:
         return _SOURCE_TYPE_BY_MIME[mime_type]
-    if filename.lower().endswith(".pdf"):
+    suffix = filename.lower()
+    if suffix.endswith(".pdf"):
         return "pdf"
+    if suffix.endswith(".docx"):
+        return "docx"
+    if suffix.endswith((".txt", ".text")):
+        return "txt"
     return "file"
 
 

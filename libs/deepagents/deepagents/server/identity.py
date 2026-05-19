@@ -230,6 +230,10 @@ class UserCenter(Protocol):
         """Load one active thread visible to a user."""
         ...
 
+    def delete_thread(self, *, tenant_id: str, user_id: str, thread_id: str) -> bool:
+        """Soft-delete one active thread visible to a user."""
+        ...
+
     def append_message(
         self,
         *,
@@ -444,6 +448,14 @@ class InMemoryUserCenter:
         if thread is None or thread.tenant_id != tenant_id or thread.user_id != user_id or thread.status != "active":
             return None
         return thread
+
+    def delete_thread(self, *, tenant_id: str, user_id: str, thread_id: str) -> bool:
+        """Soft-delete one active thread visible to a user."""
+        thread = self.get_thread(tenant_id=tenant_id, user_id=user_id, thread_id=thread_id)
+        if thread is None:
+            return False
+        self._threads[thread_id] = replace(thread, status="deleted", updated_at=_now())
+        return True
 
     def append_message(
         self,
@@ -785,6 +797,21 @@ class PostgresUserCenter:
         if row is None:
             return None
         return _thread_from_row(row)
+
+    def delete_thread(self, *, tenant_id: str, user_id: str, thread_id: str) -> bool:
+        """Soft-delete one active thread visible to a user."""
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE agent_threads
+                SET status = 'deleted', updated_at = now()
+                WHERE tenant_id = %(tenant_id)s AND user_id = %(user_id)s AND thread_id = %(thread_id)s AND status = 'active'
+                RETURNING thread_id
+                """,
+                {"tenant_id": tenant_id, "user_id": user_id, "thread_id": thread_id},
+            )
+            row = cursor.fetchone()
+        return row is not None
 
     def append_message(
         self,

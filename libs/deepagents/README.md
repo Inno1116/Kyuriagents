@@ -12,8 +12,8 @@ Get-Content .\deepagents\runtime\runtime.env | ForEach-Object {
 
 前端服务启动命令
 
-cd D:\Agent\Kyuriagents\apps\web
-python -m http.server 5173 --bind 127.0.0.1
+cd D:\Agent\Kyuriagents\apps\web-next
+npm run dev
 
 还要启动worker
 .\.venv\Scripts\python.exe scripts\ingestion_worker.py
