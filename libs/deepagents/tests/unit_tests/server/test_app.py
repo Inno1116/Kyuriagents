@@ -49,6 +49,14 @@ class FakeAgent:
         yield from self.stream_items
 
 
+class QuotaFailingAgent(FakeAgent):
+    def invoke(self, input_data: dict[str, object], config: dict[str, object] | None = None) -> dict[str, list[AIMessage]]:
+        self.input_data = input_data
+        self.config = config
+        msg = "Error code: 429 - insufficient_quota"
+        raise RuntimeError(msg)
+
+
 class FakeToolChunk:
     type = "AIMessageChunk"
     content = "I will search first."
@@ -149,6 +157,30 @@ def test_api_chat_flow_creates_authenticated_thread_messages():
     assert isinstance(system_prompt, str)
     assert "For comparison questions" in system_prompt
     assert _agent_message_contents(agent) == ["hello"]
+
+
+def test_api_chat_returns_public_message_for_quota_errors():
+    center = InMemoryUserCenter()
+    app = create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key"),
+        user_center=center,
+        agent_factory=lambda _config, **_kwargs: QuotaFailingAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+        json={"message": "hello", "title": "quota"},
+    )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "模型额度可能已用尽" in detail
+    assert "210825684@qq.com" in detail
 
 
 def test_api_thread_delete_hides_thread_from_recent_list() -> None:

@@ -24,6 +24,7 @@ from deepagents.ingestion.store import (
 from deepagents.rag._text import tokenize
 from deepagents.rag.metadata import ChunkMetadata
 from deepagents.rag.types import DocumentChunk
+from deepagents.runtime.errors import public_error_message
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -239,7 +240,7 @@ class KnowledgeBaseService:
         try:
             self._process_job(job)
         except Exception as exc:  # noqa: BLE001  # The worker must persist unexpected parser/indexer failures.
-            self._store.mark_job_failed(job_id=job.job_id, doc_id=job.doc_id, error_message=str(exc))
+            self._store.mark_job_failed(job_id=job.job_id, doc_id=job.doc_id, error_message=public_error_message(exc))
         return job
 
     def _process_job(self, job: IngestionJobRecord) -> None:

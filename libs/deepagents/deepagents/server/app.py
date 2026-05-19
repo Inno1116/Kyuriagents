@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from deepagents.ingestion import KnowledgeBaseService
 from deepagents.runtime import AgentRuntimeConfig, create_kyuri_agent
+from deepagents.runtime.errors import public_error_message
 from deepagents.server.identity import AuthContext, DuplicateUserError, MessageRecord, PostgresUserCenter, ThreadRecord, UserCenter
 from deepagents.tasks import TaskRuntime
 
@@ -712,10 +713,13 @@ def _register_chat_route(
         )
         agent_config = _chat_runtime_config(config, context=context, thread=thread, request=request)
         agent = cast("_Agent", agent_factory(agent_config, system_prompt=_DEFAULT_API_SYSTEM_PROMPT))
-        result = agent.invoke(
-            _chat_input(history, user_message=user_message, agent_config=agent_config),
-            config=_graph_config(context=context, thread=thread),
-        )
+        try:
+            result = agent.invoke(
+                _chat_input(history, user_message=user_message, agent_config=agent_config),
+                config=_graph_config(context=context, thread=thread),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=public_error_message(exc)) from exc
         content = _assistant_text(cast("Mapping[str, object]", result))
         assistant_message = user_center.append_message(
             tenant_id=context.tenant.tenant_id,
@@ -844,7 +848,7 @@ def _chat_event_source(
             },
         )
     except Exception as exc:  # noqa: BLE001  # Streaming endpoints must send errors after headers are committed.
-        yield _sse("error", {"detail": str(exc)})
+        yield _sse("error", {"detail": public_error_message(exc)})
 
 
 def _task_event_source(
@@ -891,7 +895,7 @@ def _task_event_source(
         last_snapshot=last_snapshot,
     )
     if state.error is not None:
-        yield _sse("error", {"detail": str(state.error)})
+        yield _sse("error", {"detail": public_error_message(state.error)})
         return
     result = state.result
     if result is None:
@@ -1347,12 +1351,21 @@ def _task_or_404(task_runtime: TaskRuntime, *, context: AuthContext, task_id: st
 
 def _task_payload(result: object) -> dict[str, object]:
     payload = cast("Any", result)
+    task = _task_record_dict(payload.task)
     return {
-        "task": _record_dict(payload.task),
-        "steps": [_record_dict(step) for step in payload.steps],
+        "task": task,
+        "steps": [_task_record_dict(step) for step in payload.steps],
         "events": [_record_dict(event) for event in payload.events],
         "final_answer": str(payload.final_answer),
     }
+
+
+def _task_record_dict(record: object) -> dict[str, object]:
+    data = _record_dict(record)
+    error = data.get("error_message")
+    if isinstance(error, str) and error:
+        data["error_message"] = public_error_message(error)
+    return data
 
 
 def _record_dict(record: object) -> dict[str, object]:
