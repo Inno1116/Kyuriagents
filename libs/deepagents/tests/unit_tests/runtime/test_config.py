@@ -29,11 +29,18 @@ def test_runtime_config_from_env_parses_services_and_modes() -> None:
             "DEEPAGENTS_MEMORY_CHECKPOINT_INTERVAL": "12",
             "DEEPAGENTS_MEMORY_CHECKPOINT_MAX_CHARS": "2048",
             "DEEPAGENTS_ENABLE_CONTEXT_SUMMARIZATION": "true",
+            "DEEPAGENTS_CONTEXT_SUMMARY_TRIGGER_TOKENS": "90000",
             "DEEPAGENTS_CONTEXT_SUMMARY_TRIGGER_MESSAGES": "50",
             "DEEPAGENTS_CONTEXT_SUMMARY_KEEP_MESSAGES": "16",
+            "DEEPAGENTS_REDIS_URL": "redis://example.test:6379/2",
+            "KYURI_MAX_USER_INPUT_TOKENS": "12800",
+            "QWEN_TOKENIZER_MODEL": "Qwen/Qwen3-8B",
             "DEEPAGENTS_API_ADMIN_KEY": "admin-secret",
             "DEEPAGENTS_AUTH_TOKEN_TTL_DAYS": "14",
             "DEEPAGENTS_API_CORS_ORIGINS": "http://127.0.0.1:5173,http://localhost:5173",
+            "DEEPAGENTS_ENABLE_INGESTION_REDIS_QUEUE": "true",
+            "DEEPAGENTS_INGESTION_REDIS_QUEUE_NAME": "kyuri:test:ingestion",
+            "DEEPAGENTS_INGESTION_REDIS_BLOCK_TIMEOUT_SECONDS": "5",
         }
     )
 
@@ -56,11 +63,17 @@ def test_runtime_config_from_env_parses_services_and_modes() -> None:
     assert config.memory_checkpoint_interval == 12
     assert config.memory_checkpoint_max_chars == 2048
     assert config.enable_context_summarization
-    assert config.context_summary_trigger() == ("messages", 50)
+    assert config.context_summary_trigger() == ("tokens", 90000)
     assert config.context_summary_keep() == ("messages", 16)
+    assert config.redis_url == "redis://example.test:6379/2"
+    assert config.max_user_input_tokens == 12800
+    assert config.tokenizer_model == "Qwen/Qwen3-8B"
     assert config.api_admin_key == "admin-secret"
     assert config.auth_token_ttl_days == 14
     assert config.api_cors_origins == ("http://127.0.0.1:5173", "http://localhost:5173")
+    assert config.enable_ingestion_redis_queue
+    assert config.ingestion_redis_queue_name == "kyuri:test:ingestion"
+    assert config.ingestion_redis_block_timeout_seconds == 5
 
 
 def test_runtime_config_rejects_invalid_modes() -> None:
@@ -70,7 +83,7 @@ def test_runtime_config_rejects_invalid_modes() -> None:
 
 def test_runtime_config_rejects_invalid_context_summary_window() -> None:
     with pytest.raises(ValueError, match="greater than"):
-        AgentRuntimeConfig(context_summary_trigger_messages=8, context_summary_keep_messages=8)
+        AgentRuntimeConfig(context_summary_trigger_tokens=0, context_summary_trigger_messages=8, context_summary_keep_messages=8)
 
 
 def test_runtime_config_reports_missing_runtime_secrets() -> None:

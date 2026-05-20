@@ -26,12 +26,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    service = KnowledgeBaseService(config=AgentRuntimeConfig.from_env())
+    config = AgentRuntimeConfig.from_env()
+    service = KnowledgeBaseService(config=config)
+    wait_for_queue = config.enable_ingestion_redis_queue and not args.once
     while True:
         failed = service.fail_stale_jobs(max_age_seconds=args.job_timeout_seconds)
         if failed:
             _LOGGER.info("marked stale ingestion jobs failed: %s", failed)
-        job = service.process_next_job()
+        job = service.process_next_job(
+            wait_for_queue=wait_for_queue,
+            queue_timeout_seconds=config.ingestion_redis_block_timeout_seconds,
+        )
         if job is None:
             if args.once:
                 _LOGGER.info("no queued ingestion jobs")

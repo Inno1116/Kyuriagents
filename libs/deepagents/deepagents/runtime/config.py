@@ -61,11 +61,28 @@ class AgentRuntimeConfig:
             memory checkpoint.
         enable_context_summarization: Whether to enable short-term thread
             summarization before model calls.
-        context_summary_trigger_messages: Number of messages that triggers
-            short-term conversation summarization. Use `0` to fall back to
-            model-aware defaults.
+        context_summary_trigger_tokens: Approximate input tokens that trigger
+            short-term conversation summarization. Use `0` to disable the
+            token trigger.
+        context_summary_trigger_messages: Legacy message-count trigger for
+            short-term conversation summarization. This is only used when the
+            token trigger is disabled.
         context_summary_keep_messages: Number of recent messages preserved
             after short-term conversation summarization.
+        redis_url: Redis URL used for pending turns and per-thread locks.
+        pending_turn_ttl_seconds: Time-to-live for pending turn buffers.
+        thread_lock_ttl_seconds: Time-to-live for one in-flight thread lock.
+        context_window_tokens: Runtime context window used for local budgeting.
+        reserved_output_tokens: Tokens reserved for model output.
+        context_safety_ratio: Conservative multiplier applied to the context window.
+        max_user_input_tokens: Maximum tokens accepted in one user message.
+        max_rag_context_tokens: Maximum retrieved RAG context tokens.
+        max_memory_context_tokens: Maximum retrieved memory context tokens.
+        max_tool_result_tokens: Maximum one tool result tokens.
+        tokenizer_model: Qwen tokenizer model used for local token counting.
+        tokenizer_local_files_only: Whether tokenization may only use cached files.
+        tokenizer_strict: Whether tokenizer loading failures should raise instead
+            of falling back to approximate counting.
         api_admin_key: Optional bootstrap key for API admin endpoints.
         auth_token_ttl_days: Number of days before login tokens expire. Use `0`
             for non-expiring tokens in local development.
@@ -85,6 +102,11 @@ class AgentRuntimeConfig:
         ingestion_parser_mode: Parser backend used by ingestion workers.
         ingestion_mcp_config_path: Optional MCP config path used only for document parsing.
         ingestion_mcp_tool_name: MCP tool name expected to parse one document.
+        enable_ingestion_redis_queue: Whether uploads publish ingestion job ids
+            to Redis so workers can wake without relying only on polling.
+        ingestion_redis_queue_name: Redis list key used for ingestion job ids.
+        ingestion_redis_block_timeout_seconds: Maximum seconds a worker blocks
+            waiting for one Redis queue signal.
         ingestion_chunk_chars: Maximum characters per indexed document chunk.
         ingestion_chunk_overlap: Characters repeated between adjacent chunks.
         ingestion_embedding_batch_size: Maximum documents sent in one embedding request.
@@ -121,8 +143,22 @@ class AgentRuntimeConfig:
     memory_checkpoint_interval: int = 10
     memory_checkpoint_max_chars: int = 3_000
     enable_context_summarization: bool = True
-    context_summary_trigger_messages: int = 40
+    context_summary_trigger_tokens: int = 100_000
+    context_summary_trigger_messages: int = 0
     context_summary_keep_messages: int = 12
+    redis_url: str = "redis://localhost:6379/0"
+    pending_turn_ttl_seconds: int = 10 * 60
+    thread_lock_ttl_seconds: int = 3 * 60
+    context_window_tokens: int = 128_000
+    reserved_output_tokens: int = 8_192
+    context_safety_ratio: float = 0.85
+    max_user_input_tokens: int = 12_800
+    max_rag_context_tokens: int = 12_000
+    max_memory_context_tokens: int = 3_000
+    max_tool_result_tokens: int = 6_000
+    tokenizer_model: str = "Qwen/Qwen3-8B"
+    tokenizer_local_files_only: bool = True
+    tokenizer_strict: bool = False
     api_admin_key: str | None = None
     auth_token_ttl_days: int = 30
     api_cors_origins: tuple[str, ...] = ("http://127.0.0.1:5173", "http://localhost:5173")
@@ -141,6 +177,9 @@ class AgentRuntimeConfig:
     ingestion_parser_mode: Literal["auto", "local", "mcp"] = "auto"
     ingestion_mcp_config_path: str | None = None
     ingestion_mcp_tool_name: str = "parse_document"
+    enable_ingestion_redis_queue: bool = False
+    ingestion_redis_queue_name: str = "kyuri:ingestion:jobs"
+    ingestion_redis_block_timeout_seconds: int = 2
     ingestion_chunk_chars: int = 1_200
     ingestion_chunk_overlap: int = 180
     ingestion_embedding_batch_size: int = 10
@@ -148,19 +187,61 @@ class AgentRuntimeConfig:
 
     def __post_init__(self) -> None:
         """Validate context window settings."""
+        self._validate_summary_config()
+        self._validate_runtime_budget_config()
+        if self.upload_max_bytes <= 0:
+            msg = "`upload_max_bytes` must be positive."
+            raise ValueError(msg)
+        self._validate_ingestion_config()
+
+    def _validate_summary_config(self) -> None:
+        """Validate short-term context summarization settings."""
+        if self.context_summary_trigger_tokens < 0:
+            msg = "`context_summary_trigger_tokens` must not be negative."
+            raise ValueError(msg)
         if self.context_summary_trigger_messages < 0:
             msg = "`context_summary_trigger_messages` must not be negative."
             raise ValueError(msg)
         if self.context_summary_keep_messages <= 0:
             msg = "`context_summary_keep_messages` must be positive."
             raise ValueError(msg)
-        if self.context_summary_trigger_messages > 0 and self.context_summary_trigger_messages <= self.context_summary_keep_messages:
+        if (
+            self.context_summary_trigger_tokens == 0
+            and self.context_summary_trigger_messages > 0
+            and self.context_summary_trigger_messages <= self.context_summary_keep_messages
+        ):
             msg = "`context_summary_trigger_messages` must be greater than `context_summary_keep_messages`."
             raise ValueError(msg)
-        if self.upload_max_bytes <= 0:
-            msg = "`upload_max_bytes` must be positive."
+
+    def _validate_runtime_budget_config(self) -> None:
+        """Validate Redis and token budget runtime settings."""
+        if self.pending_turn_ttl_seconds <= 0:
+            msg = "`pending_turn_ttl_seconds` must be positive."
             raise ValueError(msg)
-        self._validate_ingestion_config()
+        if self.thread_lock_ttl_seconds <= 0:
+            msg = "`thread_lock_ttl_seconds` must be positive."
+            raise ValueError(msg)
+        if self.context_window_tokens <= 0:
+            msg = "`context_window_tokens` must be positive."
+            raise ValueError(msg)
+        if self.reserved_output_tokens < 0:
+            msg = "`reserved_output_tokens` must not be negative."
+            raise ValueError(msg)
+        if not 0 < self.context_safety_ratio <= 1:
+            msg = "`context_safety_ratio` must be between 0 and 1."
+            raise ValueError(msg)
+        if self.max_user_input_tokens <= 0:
+            msg = "`max_user_input_tokens` must be positive."
+            raise ValueError(msg)
+        if self.max_rag_context_tokens <= 0:
+            msg = "`max_rag_context_tokens` must be positive."
+            raise ValueError(msg)
+        if self.max_memory_context_tokens <= 0:
+            msg = "`max_memory_context_tokens` must be positive."
+            raise ValueError(msg)
+        if self.max_tool_result_tokens <= 0:
+            msg = "`max_tool_result_tokens` must be positive."
+            raise ValueError(msg)
 
     def _validate_ingestion_config(self) -> None:
         """Validate ingestion-specific runtime settings."""
@@ -181,6 +262,9 @@ class AgentRuntimeConfig:
             raise ValueError(msg)
         if self.ingestion_job_timeout_seconds < 0:
             msg = "`ingestion_job_timeout_seconds` must not be negative."
+            raise ValueError(msg)
+        if self.ingestion_redis_block_timeout_seconds < 0:
+            msg = "`ingestion_redis_block_timeout_seconds` must not be negative."
             raise ValueError(msg)
 
     @classmethod
@@ -234,8 +318,22 @@ class AgentRuntimeConfig:
             memory_checkpoint_interval=_int_env(source, "DEEPAGENTS_MEMORY_CHECKPOINT_INTERVAL", default=10),
             memory_checkpoint_max_chars=_int_env(source, "DEEPAGENTS_MEMORY_CHECKPOINT_MAX_CHARS", default=3_000),
             enable_context_summarization=_bool_env(source, "DEEPAGENTS_ENABLE_CONTEXT_SUMMARIZATION", default=True),
-            context_summary_trigger_messages=_int_env(source, "DEEPAGENTS_CONTEXT_SUMMARY_TRIGGER_MESSAGES", default=40),
+            context_summary_trigger_tokens=_int_env(source, "DEEPAGENTS_CONTEXT_SUMMARY_TRIGGER_TOKENS", default=100_000),
+            context_summary_trigger_messages=_int_env(source, "DEEPAGENTS_CONTEXT_SUMMARY_TRIGGER_MESSAGES", default=0),
             context_summary_keep_messages=_int_env(source, "DEEPAGENTS_CONTEXT_SUMMARY_KEEP_MESSAGES", default=12),
+            redis_url=_env(source, "DEEPAGENTS_REDIS_URL", "REDIS_URL", default="redis://localhost:6379/0"),
+            pending_turn_ttl_seconds=_int_env(source, "DEEPAGENTS_PENDING_TURN_TTL_SECONDS", default=10 * 60),
+            thread_lock_ttl_seconds=_int_env(source, "DEEPAGENTS_THREAD_LOCK_TTL_SECONDS", default=3 * 60),
+            context_window_tokens=_int_env(source, "KYURI_CONTEXT_WINDOW_TOKENS", "DEEPAGENTS_CONTEXT_WINDOW_TOKENS", default=128_000),
+            reserved_output_tokens=_int_env(source, "KYURI_RESERVED_OUTPUT_TOKENS", "DEEPAGENTS_RESERVED_OUTPUT_TOKENS", default=8_192),
+            context_safety_ratio=_float_env(source, "KYURI_CONTEXT_SAFETY_RATIO", "DEEPAGENTS_CONTEXT_SAFETY_RATIO", default=0.85),
+            max_user_input_tokens=_int_env(source, "KYURI_MAX_USER_INPUT_TOKENS", "DEEPAGENTS_MAX_USER_INPUT_TOKENS", default=12_800),
+            max_rag_context_tokens=_int_env(source, "KYURI_MAX_RAG_CONTEXT_TOKENS", "DEEPAGENTS_MAX_RAG_CONTEXT_TOKENS", default=12_000),
+            max_memory_context_tokens=_int_env(source, "KYURI_MAX_MEMORY_CONTEXT_TOKENS", "DEEPAGENTS_MAX_MEMORY_CONTEXT_TOKENS", default=3_000),
+            max_tool_result_tokens=_int_env(source, "KYURI_MAX_TOOL_RESULT_TOKENS", "DEEPAGENTS_MAX_TOOL_RESULT_TOKENS", default=6_000),
+            tokenizer_model=_env(source, "QWEN_TOKENIZER_MODEL", "KYURI_TOKENIZER_MODEL", default="Qwen/Qwen3-8B"),
+            tokenizer_local_files_only=_bool_env(source, "QWEN_TOKENIZER_LOCAL_FILES_ONLY", default=True),
+            tokenizer_strict=_bool_env(source, "QWEN_TOKENIZER_STRICT", default=False),
             api_admin_key=_optional_env(source, "DEEPAGENTS_API_ADMIN_KEY"),
             auth_token_ttl_days=_int_env(source, "DEEPAGENTS_AUTH_TOKEN_TTL_DAYS", default=30),
             api_cors_origins=_tuple_env(source, "DEEPAGENTS_API_CORS_ORIGINS") or ("http://127.0.0.1:5173", "http://localhost:5173"),
@@ -254,6 +352,9 @@ class AgentRuntimeConfig:
             ingestion_parser_mode=_ingestion_parser_mode(_env(source, "DEEPAGENTS_INGESTION_PARSER", default="auto")),
             ingestion_mcp_config_path=_optional_env(source, "DEEPAGENTS_INGESTION_MCP_CONFIG_PATH"),
             ingestion_mcp_tool_name=_env(source, "DEEPAGENTS_INGESTION_MCP_TOOL_NAME", default="parse_document"),
+            enable_ingestion_redis_queue=_bool_env(source, "DEEPAGENTS_ENABLE_INGESTION_REDIS_QUEUE", default=False),
+            ingestion_redis_queue_name=_env(source, "DEEPAGENTS_INGESTION_REDIS_QUEUE_NAME", default="kyuri:ingestion:jobs"),
+            ingestion_redis_block_timeout_seconds=_int_env(source, "DEEPAGENTS_INGESTION_REDIS_BLOCK_TIMEOUT_SECONDS", default=2),
             ingestion_chunk_chars=_int_env(source, "DEEPAGENTS_INGESTION_CHUNK_CHARS", default=1_200),
             ingestion_chunk_overlap=_int_env(source, "DEEPAGENTS_INGESTION_CHUNK_OVERLAP", default=180),
             ingestion_embedding_batch_size=_int_env(source, "DEEPAGENTS_INGESTION_EMBEDDING_BATCH_SIZE", default=10),
@@ -312,8 +413,10 @@ class AgentRuntimeConfig:
             thread_id=self.thread_id,
         )
 
-    def context_summary_trigger(self) -> tuple[Literal["messages"], int] | None:
+    def context_summary_trigger(self) -> tuple[Literal["tokens", "messages"], int] | None:
         """Return the short-term summarization trigger for Deep Agents."""
+        if self.context_summary_trigger_tokens > 0:
+            return ("tokens", self.context_summary_trigger_tokens)
         if self.context_summary_trigger_messages == 0:
             return None
         return ("messages", self.context_summary_trigger_messages)
@@ -358,6 +461,13 @@ def _int_env(source: Mapping[str, str], *names: str, default: int) -> int:
     if value is None:
         return default
     return int(value)
+
+
+def _float_env(source: Mapping[str, str], *names: str, default: float) -> float:
+    value = _optional_env(source, *names)
+    if value is None:
+        return default
+    return float(value)
 
 
 def _tuple_env(source: Mapping[str, str], *names: str) -> tuple[str, ...]:

@@ -36,6 +36,19 @@ class FakeIndexer:
         self.deleted_docs.append((tenant_id, kb_id, doc_id))
 
 
+class FakeQueue:
+    def __init__(self) -> None:
+        self.enqueued = []
+        self.waits = []
+
+    def enqueue(self, job_id: str) -> None:
+        self.enqueued.append(job_id)
+
+    def wait_for_job(self, *, timeout_seconds: int) -> str | None:
+        self.waits.append(timeout_seconds)
+        return None
+
+
 def test_upload_document_creates_job_and_worker_indexes_chunks(tmp_path):
     store = InMemoryKnowledgeBaseStore()
     indexer = FakeIndexer()
@@ -73,6 +86,60 @@ def test_upload_document_creates_job_and_worker_indexes_chunks(tmp_path):
     documents = service.list_documents(tenant_id="tenant_1", user_id="user_1", kb_id=kb.kb_id)
     assert documents[0].status == "active"
     assert documents[0].title == "Uploaded PDF"
+
+
+def test_upload_document_publishes_ingestion_wakeup(tmp_path):
+    store = InMemoryKnowledgeBaseStore()
+    queue = FakeQueue()
+    service = KnowledgeBaseService(
+        config=AgentRuntimeConfig(
+            tenant_id="tenant_1",
+            user_id="user_1",
+            upload_dir=str(tmp_path),
+            ingestion_parser_mode="local",
+            embedding_model="text-embedding-v4",
+            embedding_dimensions=1024,
+        ),
+        store=store,
+        parser=FakeParser(),
+        indexer=FakeIndexer(),
+        job_queue=queue,
+    )
+    kb = service.create_knowledge_base(tenant_id="tenant_1", user_id="user_1", name="PDF KB")
+
+    _document, job = service.upload_document(
+        tenant_id="tenant_1",
+        user_id="user_1",
+        kb_id=kb.kb_id,
+        filename="sample.pdf",
+        mime_type="application/pdf",
+        content=b"%PDF fake text pdf",
+    )
+
+    assert queue.enqueued == [job.job_id]
+
+
+def test_process_next_job_waits_on_ingestion_queue_when_enabled(tmp_path):
+    queue = FakeQueue()
+    service = KnowledgeBaseService(
+        config=AgentRuntimeConfig(
+            tenant_id="tenant_1",
+            user_id="user_1",
+            upload_dir=str(tmp_path),
+            ingestion_parser_mode="local",
+            embedding_model="text-embedding-v4",
+            embedding_dimensions=1024,
+        ),
+        store=InMemoryKnowledgeBaseStore(),
+        parser=FakeParser(),
+        indexer=FakeIndexer(),
+        job_queue=queue,
+    )
+
+    processed = service.process_next_job(wait_for_queue=True, queue_timeout_seconds=7)
+
+    assert processed is None
+    assert queue.waits == [7]
 
 
 def test_delete_document_hides_it_and_removes_indexed_chunks(tmp_path):

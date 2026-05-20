@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from deepagents.ingestion.indexing import HybridChunkIndexer
 from deepagents.ingestion.parsers import DocumentParser, ParseRequest, build_document_parser
+from deepagents.ingestion.redis_queue import IngestionJobQueue, default_ingestion_job_queue
 from deepagents.ingestion.store import (
     DocumentRecord,
     IngestionJobRecord,
@@ -36,6 +38,7 @@ _DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingm
 _SOURCE_TYPE_BY_MIME = {"application/pdf": "pdf", _DOCX_MIME_TYPE: "docx", "text/plain": "txt"}
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _MIN_KEYWORD_LENGTH = 3
+_LOGGER = logging.getLogger(__name__)
 
 
 class ChunkIndexer(Protocol):
@@ -64,6 +67,7 @@ class KnowledgeBaseService:
         store: KnowledgeBaseStore | None = None,
         parser: DocumentParser | None = None,
         indexer: ChunkIndexer | None = None,
+        job_queue: IngestionJobQueue | None = None,
     ) -> None:
         """Initialize the service.
 
@@ -72,11 +76,13 @@ class KnowledgeBaseService:
             store: Optional metadata store.
             parser: Optional document parser.
             indexer: Optional hybrid chunk indexer.
+            job_queue: Optional Redis wake-up queue for ingestion workers.
         """
         self._config = config
         self._store = store or _default_store(config)
         self._parser = parser or build_document_parser(config)
         self._indexer = indexer or HybridChunkIndexer(config=config)
+        self._job_queue = job_queue or default_ingestion_job_queue(config)
         self._upload_root = Path(config.upload_dir)
 
     @property
@@ -176,7 +182,7 @@ class KnowledgeBaseService:
             "mime_type": normalized_mime,
             "visibility": kb.visibility,
         }
-        return self._store.create_document_job(
+        document, job = self._store.create_document_job(
             tenant_id=tenant_id,
             user_id=user_id,
             kb_id=kb_id,
@@ -190,6 +196,8 @@ class KnowledgeBaseService:
             parser_mode=parser_mode or self._config.ingestion_parser_mode,
             metadata=metadata,
         )
+        self._enqueue_job(job.job_id)
+        return document, job
 
     def list_documents(self, *, tenant_id: str, user_id: str, kb_id: str, limit: int = 100) -> list[DocumentRecord]:
         """List documents for a knowledge base."""
@@ -228,13 +236,26 @@ class KnowledgeBaseService:
             error_message=f"Ingestion job exceeded {timeout} seconds.",
         )
 
-    def process_next_job(self) -> IngestionJobRecord | None:
+    def process_next_job(
+        self,
+        *,
+        wait_for_queue: bool = False,
+        queue_timeout_seconds: int | None = None,
+    ) -> IngestionJobRecord | None:
         """Process one queued ingestion job.
+
+        Args:
+            wait_for_queue: Whether to wait on the configured wake-up queue when
+                PostgreSQL has no immediately queued jobs.
+            queue_timeout_seconds: Optional queue wait timeout override.
 
         Returns:
             Claimed job, or `None` when no queued job exists.
         """
         job = self._store.claim_next_job()
+        if job is None and wait_for_queue:
+            self._wait_for_queued_job(timeout_seconds=queue_timeout_seconds)
+            job = self._store.claim_next_job()
         if job is None:
             return None
         try:
@@ -305,6 +326,19 @@ class KnowledgeBaseService:
         if job.parser_mode == self._config.ingestion_parser_mode:
             return self._parser
         return build_document_parser(replace(self._config, ingestion_parser_mode=job.parser_mode))
+
+    def _enqueue_job(self, job_id: str) -> None:
+        try:
+            self._job_queue.enqueue(job_id)
+        except Exception as exc:  # noqa: BLE001  # Redis wakeups are best-effort; PostgreSQL keeps the job durable.
+            _LOGGER.warning("failed to publish ingestion job wakeup: %s", public_error_message(exc))
+
+    def _wait_for_queued_job(self, *, timeout_seconds: int | None) -> None:
+        timeout = self._config.ingestion_redis_block_timeout_seconds if timeout_seconds is None else timeout_seconds
+        try:
+            self._job_queue.wait_for_job(timeout_seconds=timeout)
+        except Exception as exc:  # noqa: BLE001  # Worker falls back to PostgreSQL polling after Redis errors.
+            _LOGGER.warning("failed to wait for ingestion job wakeup: %s", public_error_message(exc))
 
 
 def _default_store(config: AgentRuntimeConfig) -> KnowledgeBaseStore:

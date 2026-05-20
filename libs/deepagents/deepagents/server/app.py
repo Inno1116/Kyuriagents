@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -13,13 +14,25 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, TypeVar, ca
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from deepagents.ingestion import KnowledgeBaseService
 from deepagents.runtime import AgentRuntimeConfig, create_kyuri_agent
 from deepagents.runtime.errors import public_error_message
-from deepagents.server.identity import AuthContext, DuplicateUserError, MessageRecord, PostgresUserCenter, ThreadRecord, UserCenter
+from deepagents.runtime.token_budget import TokenBudgetExceeded, enforce_user_input_budget, messages_tokens, token_counter_from_config
+from deepagents.server.identity import (
+    AuthContext,
+    DuplicateUserError,
+    MessageRecord,
+    PostgresUserCenter,
+    ThreadRecord,
+    ThreadSummaryRecord,
+    ThreadSummaryUpdate,
+    UserCenter,
+)
+from deepagents.server.pending import PendingTurn, PendingTurnStore, RedisPendingTurnStore, ThreadBusyError
+from deepagents.server.summary import ThreadSummaryService, ThreadSummaryServiceProtocol
 from deepagents.tasks import TaskRuntime
 
 if TYPE_CHECKING:
@@ -73,6 +86,14 @@ class _TaskWorkerState:
     done: threading.Event = field(default_factory=threading.Event)
     result: object | None = None
     error: BaseException | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class _ChatContext:
+    """Messages and optional rolling-summary update for one chat turn."""
+
+    input_data: dict[str, list[object]]
+    summary_update: ThreadSummaryUpdate | None = None
 
 
 _MIN_PASSWORD_LENGTH = 8
@@ -210,6 +231,8 @@ def create_app(
     knowledge_service: KnowledgeBaseService | None = None,
     task_runtime: TaskRuntime | None = None,
     agent_factory: Callable[..., object] | None = None,
+    pending_turn_store: PendingTurnStore | None = None,
+    thread_summary_service: ThreadSummaryServiceProtocol | None = None,
 ) -> FastAPI:
     """Create the FastAPI application.
 
@@ -219,6 +242,8 @@ def create_app(
         knowledge_service: Optional knowledge-base ingestion service.
         task_runtime: Optional task-mode runtime.
         agent_factory: Optional agent factory for tests.
+        pending_turn_store: Optional Redis-backed pending turn store.
+        thread_summary_service: Optional persistent thread summary service.
 
     Returns:
         FastAPI app instance.
@@ -231,6 +256,8 @@ def create_app(
     resolved_knowledge = knowledge_service or KnowledgeBaseService(config=resolved_config)
     resolved_tasks = task_runtime or TaskRuntime.from_config(resolved_config)
     resolved_agent_factory = agent_factory or create_kyuri_agent
+    resolved_pending_turn_store = pending_turn_store or RedisPendingTurnStore.from_config(resolved_config)
+    resolved_summary_service = thread_summary_service or ThreadSummaryService(config=resolved_config)
     app = FastAPI(title="Deep Agents API", version="0.1.0")
     _configure_cors(app, resolved_config)
     _register_auth_routes(app=app, config=resolved_config, user_center=resolved_center)
@@ -242,6 +269,8 @@ def create_app(
         knowledge_service=resolved_knowledge,
         task_runtime=resolved_tasks,
         agent_factory=resolved_agent_factory,
+        pending_turn_store=resolved_pending_turn_store,
+        thread_summary_service=resolved_summary_service,
     )
     return app
 
@@ -348,13 +377,23 @@ def _register_user_routes(
     knowledge_service: KnowledgeBaseService,
     task_runtime: TaskRuntime,
     agent_factory: Callable[..., object],
+    pending_turn_store: PendingTurnStore,
+    thread_summary_service: ThreadSummaryServiceProtocol,
 ) -> None:
     """Register authenticated user and chat routes."""
     require_auth = _make_auth_dependency(user_center)
     _register_user_metadata_routes(app=app, user_center=user_center, require_auth=require_auth)
     _register_knowledge_routes(app=app, config=config, knowledge_service=knowledge_service, require_auth=require_auth)
-    _register_task_routes(app=app, user_center=user_center, task_runtime=task_runtime, require_auth=require_auth)
-    _register_chat_route(app=app, config=config, user_center=user_center, agent_factory=agent_factory, require_auth=require_auth)
+    _register_task_routes(app=app, config=config, user_center=user_center, task_runtime=task_runtime, require_auth=require_auth)
+    _register_chat_route(
+        app=app,
+        config=config,
+        user_center=user_center,
+        agent_factory=agent_factory,
+        pending_turn_store=pending_turn_store,
+        thread_summary_service=thread_summary_service,
+        require_auth=require_auth,
+    )
 
 
 def _make_auth_dependency(user_center: UserCenter) -> Callable[..., AuthContext]:
@@ -560,6 +599,7 @@ def _register_knowledge_routes(
 def _register_task_routes(
     *,
     app: FastAPI,
+    config: AgentRuntimeConfig,
     user_center: UserCenter,
     task_runtime: TaskRuntime,
     require_auth: Callable[..., AuthContext],
@@ -569,20 +609,13 @@ def _register_task_routes(
 
     @app.post("/v1/tasks", response_model=RecordResponse)
     def create_task(request: TaskCreateRequest, context: AuthContext = auth_dependency) -> RecordResponse:
+        _raise_if_user_input_too_large(config, request.goal)
         try:
             chat_request = ChatRequest(message=request.goal, thread_id=request.thread_id, title=request.title)
             thread = _resolve_thread(user_center, context=context, request=chat_request)
         except ThreadNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.") from exc
         history = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=thread.thread_id, limit=100)
-        user_center.append_message(
-            tenant_id=context.tenant.tenant_id,
-            thread_id=thread.thread_id,
-            user_id=context.user.user_id,
-            role="user",
-            content=request.goal,
-            metadata={"task_mode": True},
-        )
         result = task_runtime.run(
             tenant_id=context.tenant.tenant_id,
             user_id=context.user.user_id,
@@ -594,17 +627,18 @@ def _register_task_routes(
             disabled_tools=("search_knowledge_base",) if request.rag_enabled is False else (),
         )
         if result.final_answer:
-            user_center.append_message(
+            user_center.append_turn(
                 tenant_id=context.tenant.tenant_id,
                 thread_id=thread.thread_id,
                 user_id=context.user.user_id,
-                role="assistant",
-                content=result.final_answer,
-                metadata={"task_id": result.task.task_id, "task_mode": True},
+                user_content=request.goal,
+                assistant_content=result.final_answer,
+                user_metadata={"task_id": result.task.task_id, "task_mode": True},
+                assistant_metadata={"task_id": result.task.task_id, "task_mode": True},
             )
         return RecordResponse(data=_task_payload(result))
 
-    _register_task_stream_route(app=app, user_center=user_center, task_runtime=task_runtime, auth_dependency=auth_dependency)
+    _register_task_stream_route(app=app, config=config, user_center=user_center, task_runtime=task_runtime, auth_dependency=auth_dependency)
 
     @app.get("/v1/tasks", response_model=RecordResponse)
     def list_tasks(context: AuthContext = auth_dependency, limit: int = 50) -> RecordResponse:
@@ -640,6 +674,7 @@ def _register_task_routes(
 def _register_task_stream_route(
     *,
     app: FastAPI,
+    config: AgentRuntimeConfig,
     user_center: UserCenter,
     task_runtime: TaskRuntime,
     auth_dependency: AuthContext,
@@ -648,20 +683,13 @@ def _register_task_stream_route(
 
     @app.post("/v1/tasks/stream")
     def create_task_stream(request: TaskCreateRequest, context: AuthContext = auth_dependency) -> StreamingResponse:
+        _raise_if_user_input_too_large(config, request.goal)
         try:
             chat_request = ChatRequest(message=request.goal, thread_id=request.thread_id, title=request.title)
             thread = _resolve_thread(user_center, context=context, request=chat_request)
         except ThreadNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.") from exc
         history = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=thread.thread_id, limit=100)
-        user_center.append_message(
-            tenant_id=context.tenant.tenant_id,
-            thread_id=thread.thread_id,
-            user_id=context.user.user_id,
-            role="user",
-            content=request.goal,
-            metadata={"task_mode": True},
-        )
         task = task_runtime.store.create_task(
             tenant_id=context.tenant.tenant_id,
             user_id=context.user.user_id,
@@ -678,6 +706,7 @@ def _register_task_stream_route(
                 context=context,
                 task=task,
                 messages=history,
+                user_content=request.goal,
                 forced_intent=request.intent,
                 disabled_tools=("search_knowledge_base",) if request.rag_enabled is False else (),
             ),
@@ -692,6 +721,8 @@ def _register_chat_route(
     config: AgentRuntimeConfig,
     user_center: UserCenter,
     agent_factory: Callable[..., object],
+    pending_turn_store: PendingTurnStore,
+    thread_summary_service: ThreadSummaryServiceProtocol,
     require_auth: Callable[..., AuthContext],
 ) -> None:
     """Register the chat endpoint."""
@@ -699,60 +730,99 @@ def _register_chat_route(
 
     @app.post("/v1/chat", response_model=ChatResponse)
     def chat(request: ChatRequest, context: AuthContext = auth_dependency) -> ChatResponse:
+        _raise_if_user_input_too_large(config, request.message)
         try:
             thread = _resolve_thread(user_center, context=context, request=request)
         except ThreadNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.") from exc
         history = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=thread.thread_id, limit=100)
-        user_message = user_center.append_message(
-            tenant_id=context.tenant.tenant_id,
-            thread_id=thread.thread_id,
-            user_id=context.user.user_id,
-            role="user",
-            content=request.message,
-        )
-        agent_config = _chat_runtime_config(config, context=context, thread=thread, request=request)
+        try:
+            turn = pending_turn_store.start_turn(
+                tenant_id=context.tenant.tenant_id,
+                user_id=context.user.user_id,
+                thread_id=thread.thread_id,
+                user_message=request.message,
+            )
+        except ThreadBusyError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        user_message = _pending_user_message(context=context, thread=thread, content=request.message)
+        agent_config = _pending_chat_runtime_config(config, context=context, thread=thread, request=request)
         agent = cast("_Agent", agent_factory(agent_config, system_prompt=_DEFAULT_API_SYSTEM_PROMPT))
+        chat_context = _build_chat_context(
+            config=agent_config,
+            user_center=user_center,
+            summary_service=thread_summary_service,
+            context=context,
+            thread=thread,
+            history=history,
+            user_message=user_message,
+        )
         try:
             result = agent.invoke(
-                _chat_input(history, user_message=user_message, agent_config=agent_config),
+                chat_context.input_data,
                 config=_graph_config(context=context, thread=thread),
             )
+            content = _assistant_text(cast("Mapping[str, object]", result))
+            _, assistant_message = user_center.append_turn(
+                tenant_id=context.tenant.tenant_id,
+                thread_id=thread.thread_id,
+                user_id=context.user.user_id,
+                user_content=request.message,
+                assistant_content=content,
+                user_message_id=user_message.message_id,
+                user_metadata={"turn_id": turn.turn_id},
+                assistant_metadata={"turn_id": turn.turn_id},
+                summary_update=chat_context.summary_update,
+            )
+            pending_turn_store.mark_committed(turn)
         except Exception as exc:
+            pending_turn_store.mark_failed(turn, public_error_message(exc))
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=public_error_message(exc)) from exc
-        content = _assistant_text(cast("Mapping[str, object]", result))
-        assistant_message = user_center.append_message(
-            tenant_id=context.tenant.tenant_id,
-            thread_id=thread.thread_id,
-            user_id=context.user.user_id,
-            role="assistant",
-            content=content,
-        )
+        finally:
+            pending_turn_store.release(turn)
         return ChatResponse(thread_id=thread.thread_id, message_id=assistant_message.message_id, content=content)
 
     @app.post("/v1/chat/stream")
     def chat_stream(request: ChatRequest, context: AuthContext = auth_dependency) -> StreamingResponse:
+        _raise_if_user_input_too_large(config, request.message)
         try:
             thread = _resolve_thread(user_center, context=context, request=request)
         except ThreadNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.") from exc
         history = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=thread.thread_id, limit=100)
-        user_message = user_center.append_message(
-            tenant_id=context.tenant.tenant_id,
-            thread_id=thread.thread_id,
-            user_id=context.user.user_id,
-            role="user",
-            content=request.message,
-        )
-        agent_config = _chat_runtime_config(config, context=context, thread=thread, request=request)
+        try:
+            turn = pending_turn_store.start_turn(
+                tenant_id=context.tenant.tenant_id,
+                user_id=context.user.user_id,
+                thread_id=thread.thread_id,
+                user_message=request.message,
+            )
+        except ThreadBusyError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        user_message = _pending_user_message(context=context, thread=thread, content=request.message)
+        agent_config = _pending_chat_runtime_config(config, context=context, thread=thread, request=request)
         agent = cast("_Agent", agent_factory(agent_config, system_prompt=_DEFAULT_API_SYSTEM_PROMPT))
+        chat_context = _build_chat_context(
+            config=agent_config,
+            user_center=user_center,
+            summary_service=thread_summary_service,
+            context=context,
+            thread=thread,
+            history=history,
+            user_message=user_message,
+        )
         return StreamingResponse(
             _chat_event_source(
                 agent=agent,
                 user_center=user_center,
+                pending_turn_store=pending_turn_store,
+                turn=turn,
+                user_message=user_message,
                 context=context,
                 thread=thread,
-                input_data=_chat_input(history, user_message=user_message, agent_config=agent_config),
+                user_content=request.message,
+                input_data=chat_context.input_data,
+                summary_update=chat_context.summary_update,
                 graph_config=_graph_config(context=context, thread=thread),
             ),
             media_type="text/event-stream",
@@ -778,6 +848,34 @@ def _chat_runtime_config(
     return runtime
 
 
+def _pending_chat_runtime_config(
+    config: AgentRuntimeConfig,
+    *,
+    context: AuthContext,
+    thread: ThreadRecord,
+    request: ChatRequest,
+) -> AgentRuntimeConfig:
+    runtime = _chat_runtime_config(config, context=context, thread=thread, request=request)
+    memory_mode = "off" if runtime.memory_mode == "off" else "auto"
+    return replace(
+        runtime,
+        enable_checkpointer=False,
+        memory_checkpoint_interval=0,
+        memory_mode=memory_mode,
+    )
+
+
+def _pending_user_message(*, context: AuthContext, thread: ThreadRecord, content: str) -> MessageRecord:
+    return MessageRecord(
+        message_id=f"msg_{uuid.uuid4().hex}",
+        tenant_id=context.tenant.tenant_id,
+        thread_id=thread.thread_id,
+        user_id=context.user.user_id,
+        role="user",
+        content=content,
+    )
+
+
 def _chat_input(
     history: Sequence[MessageRecord],
     *,
@@ -791,6 +889,117 @@ def _chat_input(
             use_checkpointer=agent_config.enable_checkpointer,
         )
     }
+
+
+def _build_chat_context(
+    *,
+    config: AgentRuntimeConfig,
+    user_center: UserCenter,
+    summary_service: ThreadSummaryServiceProtocol,
+    context: AuthContext,
+    thread: ThreadRecord,
+    history: Sequence[MessageRecord],
+    user_message: MessageRecord,
+) -> _ChatContext:
+    if config.enable_checkpointer or not config.enable_context_summarization:
+        return _ChatContext(input_data=_chat_input(history, user_message=user_message, agent_config=config))
+
+    summary = user_center.get_thread_summary(
+        tenant_id=context.tenant.tenant_id,
+        user_id=context.user.user_id,
+        thread_id=thread.thread_id,
+    )
+    unsummarized = _messages_after_summary(history, summary)
+    summary_update = _maybe_build_summary_update(
+        config=config,
+        summary_service=summary_service,
+        summary=summary,
+        unsummarized=unsummarized,
+        user_message=user_message,
+    )
+    visible_summary = summary_update.summary if summary_update is not None else (summary.summary if summary is not None else "")
+    visible_history = _visible_history(config=config, unsummarized=unsummarized, summary_update=summary_update)
+    messages = _summary_messages(visible_summary) + _to_langchain_messages(visible_history)
+    messages.append(HumanMessage(content=user_message.content, id=user_message.message_id))
+    return _ChatContext(input_data={"messages": messages}, summary_update=summary_update)
+
+
+def _messages_after_summary(history: Sequence[MessageRecord], summary: ThreadSummaryRecord | None) -> list[MessageRecord]:
+    if summary is None:
+        return list(history)
+    return [message for message in history if message.message_seq == 0 or message.message_seq > summary.summarized_until_message_seq]
+
+
+def _maybe_build_summary_update(
+    *,
+    config: AgentRuntimeConfig,
+    summary_service: ThreadSummaryServiceProtocol,
+    summary: ThreadSummaryRecord | None,
+    unsummarized: Sequence[MessageRecord],
+    user_message: MessageRecord,
+) -> ThreadSummaryUpdate | None:
+    compactable, _kept = _split_compactable_history(config, unsummarized)
+    if not compactable:
+        return None
+    if not _should_summarize(config=config, summary=summary, unsummarized=unsummarized, user_message=user_message):
+        return None
+    existing_summary = summary.summary if summary is not None else ""
+    updated_summary = summary_service.summarize(existing_summary=existing_summary, messages=compactable)
+    if not updated_summary:
+        return None
+    summarized_until = max(message.message_seq for message in compactable)
+    counter = token_counter_from_config(config)
+    return ThreadSummaryUpdate(
+        summary=updated_summary,
+        summarized_until_message_seq=summarized_until,
+        token_count=counter.count_text(updated_summary),
+        metadata={"strategy": "rolling_thread_summary:v1", "compacted_messages": len(compactable)},
+    )
+
+
+def _should_summarize(
+    *,
+    config: AgentRuntimeConfig,
+    summary: ThreadSummaryRecord | None,
+    unsummarized: Sequence[MessageRecord],
+    user_message: MessageRecord,
+) -> bool:
+    trigger = config.context_summary_trigger()
+    if trigger is None:
+        return False
+    kind, value = trigger
+    if kind == "messages":
+        return len(unsummarized) + 1 >= value
+    counter = token_counter_from_config(config)
+    messages = _summary_messages(summary.summary if summary is not None else "") + _to_langchain_messages(unsummarized)
+    messages.append(HumanMessage(content=user_message.content, id=user_message.message_id))
+    return messages_tokens(cast("list[BaseMessage]", messages), counter) >= value
+
+
+def _visible_history(
+    *,
+    config: AgentRuntimeConfig,
+    unsummarized: Sequence[MessageRecord],
+    summary_update: ThreadSummaryUpdate | None,
+) -> list[MessageRecord]:
+    if summary_update is None:
+        return list(unsummarized)
+    _compactable, kept = _split_compactable_history(config, unsummarized)
+    return kept
+
+
+def _split_compactable_history(config: AgentRuntimeConfig, history: Sequence[MessageRecord]) -> tuple[list[MessageRecord], list[MessageRecord]]:
+    keep_count = max(config.context_summary_keep_messages, 1)
+    if len(history) <= keep_count:
+        return [], list(history)
+    return list(history[:-keep_count]), list(history[-keep_count:])
+
+
+def _summary_messages(summary: str) -> list[object]:
+    text = summary.strip()
+    if not text:
+        return []
+    return [SystemMessage(content=f"Persistent conversation summary so far:\n{text}")]
 
 
 def _graph_config(*, context: AuthContext, thread: ThreadRecord) -> dict[str, dict[str, object]]:
@@ -810,9 +1019,14 @@ def _chat_event_source(
     *,
     agent: _Agent,
     user_center: UserCenter,
+    pending_turn_store: PendingTurnStore,
+    turn: PendingTurn,
+    user_message: MessageRecord,
     context: AuthContext,
     thread: ThreadRecord,
+    user_content: str,
     input_data: Mapping[str, object],
+    summary_update: ThreadSummaryUpdate | None,
     graph_config: Mapping[str, object],
 ) -> Iterator[str]:
     content_parts: list[str] = []
@@ -825,19 +1039,26 @@ def _chat_event_source(
         for item in stream:
             mode, data = _stream_item_parts(item)
             if mode == "messages":
-                yield from _message_stream_events(data, content_parts=content_parts, seen_tools=seen_tools, stream_state=stream_state)
+                for event in _message_stream_events(data, content_parts=content_parts, seen_tools=seen_tools, stream_state=stream_state):
+                    _capture_pending_delta(event, pending_turn_store=pending_turn_store, turn=turn)
+                    yield event
             elif mode == "updates":
                 if not _tool_call_names_from_update(data):
                     final_content = _assistant_text_from_update(data) or final_content
                 yield from _update_stream_events(data, content_parts=content_parts, seen_tools=seen_tools, stream_state=stream_state)
         content = final_content or "".join(content_parts)
-        assistant_message = user_center.append_message(
+        _, assistant_message = user_center.append_turn(
             tenant_id=context.tenant.tenant_id,
             thread_id=thread.thread_id,
             user_id=context.user.user_id,
-            role="assistant",
-            content=content,
+            user_content=user_content,
+            assistant_content=content,
+            user_message_id=user_message.message_id,
+            user_metadata={"turn_id": turn.turn_id},
+            assistant_metadata={"turn_id": turn.turn_id},
+            summary_update=summary_update,
         )
+        pending_turn_store.mark_committed(turn)
         yield _sse(
             "done",
             {
@@ -848,7 +1069,10 @@ def _chat_event_source(
             },
         )
     except Exception as exc:  # noqa: BLE001  # Streaming endpoints must send errors after headers are committed.
+        pending_turn_store.mark_failed(turn, public_error_message(exc))
         yield _sse("error", {"detail": public_error_message(exc)})
+    finally:
+        pending_turn_store.release(turn)
 
 
 def _task_event_source(
@@ -858,6 +1082,7 @@ def _task_event_source(
     context: AuthContext,
     task: TaskRecord,
     messages: Sequence[MessageRecord],
+    user_content: str,
     forced_intent: Literal["chat", "task", "rag_query", "memory_query", "clarify", "unsafe"] | None,
     disabled_tools: Sequence[str],
 ) -> Iterator[str]:
@@ -905,13 +1130,14 @@ def _task_event_source(
     payload["thread_id"] = task.thread_id
     final_answer = str(payload.get("final_answer") or "")
     if final_answer:
-        assistant_message = user_center.append_message(
+        _, assistant_message = user_center.append_turn(
             tenant_id=context.tenant.tenant_id,
             thread_id=task.thread_id,
             user_id=context.user.user_id,
-            role="assistant",
-            content=final_answer,
-            metadata={"task_id": task.task_id, "task_mode": True},
+            user_content=user_content,
+            assistant_content=final_answer,
+            user_metadata={"task_id": task.task_id, "task_mode": True},
+            assistant_metadata={"task_id": task.task_id, "task_mode": True},
         )
         payload["message_id"] = assistant_message.message_id
     yield _sse("done", payload)
@@ -1151,6 +1377,28 @@ def _tool_status_text(tool_name: str) -> str:
 def _sse(event: str, payload: Mapping[str, object]) -> str:
     data = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {data}\n\n"
+
+
+def _capture_pending_delta(event: str, *, pending_turn_store: PendingTurnStore, turn: PendingTurn) -> None:
+    if not event.startswith("event: delta\n"):
+        return
+    _, _, raw = event.partition("data: ")
+    if not raw:
+        return
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    text = payload.get("text") if isinstance(payload, Mapping) else None
+    if isinstance(text, str):
+        pending_turn_store.append_delta(turn.turn_id, text)
+
+
+def _raise_if_user_input_too_large(config: AgentRuntimeConfig, text: str) -> None:
+    try:
+        enforce_user_input_budget(config, text, token_counter_from_config(config))
+    except TokenBudgetExceeded as exc:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)) from exc
 
 
 def _postgres_user_center(config: AgentRuntimeConfig) -> PostgresUserCenter:

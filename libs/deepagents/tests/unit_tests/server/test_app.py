@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any, cast
 
 import pytest
@@ -21,7 +21,8 @@ from deepagents.server.app import (
     UserCreateRequest,
     create_app,
 )
-from deepagents.server.identity import AuthContext, InMemoryUserCenter
+from deepagents.server.identity import AuthContext, InMemoryUserCenter, MessageRecord
+from deepagents.server.pending import InMemoryPendingTurnStore
 from deepagents.tasks import InMemoryTaskStore, TaskRuntime
 
 
@@ -64,6 +65,20 @@ class FakeToolChunk:
     def __init__(self, tool_name: str) -> None:
         self.tool_calls = [{"name": tool_name}]
         self.tool_call_chunks: list[dict[str, object]] = []
+
+
+class FakeSummaryService:
+    """Summary service double used to verify rolling summary persistence."""
+
+    def __init__(self, summary: str = "persisted project summary") -> None:
+        """Initialize the fake service."""
+        self.summary = summary
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def summarize(self, *, existing_summary: str, messages: Sequence[MessageRecord]) -> str:
+        """Return a deterministic summary and record compacted messages."""
+        self.calls.append((existing_summary, [message.content for message in messages]))
+        return self.summary
 
 
 SCHEMA_DRIFT_ERROR = type("UndefinedColumn", (Exception,), {})
@@ -122,7 +137,7 @@ def test_api_chat_flow_creates_authenticated_thread_messages():
         factory_kwargs.update(kwargs)
         return agent
 
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key"),
         user_center=center,
         agent_factory=factory,
@@ -161,7 +176,7 @@ def test_api_chat_flow_creates_authenticated_thread_messages():
 
 def test_api_chat_returns_public_message_for_quota_errors():
     center = InMemoryUserCenter()
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key"),
         user_center=center,
         agent_factory=lambda _config, **_kwargs: QuotaFailingAgent(),
@@ -183,9 +198,31 @@ def test_api_chat_returns_public_message_for_quota_errors():
     assert "210825684@qq.com" in detail
 
 
+def test_api_chat_rejects_oversized_input_without_messages() -> None:
+    center = InMemoryUserCenter()
+    app = _create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key", max_user_input_tokens=1),
+        user_center=center,
+        agent_factory=lambda _config, **_kwargs: FakeAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+        json={"message": "hello " * 100, "title": "too large"},
+    )
+
+    assert response.status_code == 413
+    assert center.list_threads(tenant_id=tenant.tenant_id, user_id=user.user_id) == []
+
+
 def test_api_thread_delete_hides_thread_from_recent_list() -> None:
     center = InMemoryUserCenter()
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key"),
         user_center=center,
         agent_factory=lambda _config, **_kwargs: FakeAgent(),
@@ -206,7 +243,7 @@ def test_api_thread_delete_hides_thread_from_recent_list() -> None:
 def test_api_chat_sends_history_when_checkpointer_is_disabled():
     center = InMemoryUserCenter()
     agent = FakeAgent()
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key", enable_checkpointer=False),
         user_center=center,
         agent_factory=lambda _config, **_kwargs: agent,
@@ -224,6 +261,55 @@ def test_api_chat_sends_history_when_checkpointer_is_disabled():
     assert _agent_message_contents(agent) == ["old user", "old assistant", "new user"]
 
 
+def test_api_chat_persists_rolling_summary_with_successful_turn() -> None:
+    center = InMemoryUserCenter()
+    agent = FakeAgent()
+    summary = FakeSummaryService()
+    app = _create_app(
+        config=AgentRuntimeConfig(
+            api_admin_key="admin-key",
+            context_summary_trigger_tokens=0,
+            context_summary_trigger_messages=2,
+            context_summary_keep_messages=1,
+        ),
+        user_center=center,
+        agent_factory=lambda _config, **_kwargs: agent,
+        thread_summary_service=summary,
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    thread = center.create_thread(tenant_id=tenant.tenant_id, user_id=user.user_id, thread_id="thread_1")
+    center.append_message(tenant_id=tenant.tenant_id, thread_id=thread.thread_id, user_id=user.user_id, role="user", content="old user")
+    old_assistant = center.append_message(
+        tenant_id=tenant.tenant_id,
+        thread_id=thread.thread_id,
+        user_id=user.user_id,
+        role="assistant",
+        content="old assistant",
+    )
+    center.append_message(
+        tenant_id=tenant.tenant_id,
+        thread_id=thread.thread_id,
+        user_id=user.user_id,
+        role="user",
+        content="old followup",
+    )
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    context = _require_context(center.authenticate_api_key(key.raw_key))
+
+    _endpoint(app, "/v1/chat", "POST")(ChatRequest(message="new user", thread_id=thread.thread_id), context)
+
+    stored = center.get_thread_summary(tenant_id=tenant.tenant_id, user_id=user.user_id, thread_id=thread.thread_id)
+    assert stored is not None
+    assert stored.summary == "persisted project summary"
+    assert stored.summarized_until_message_seq == old_assistant.message_seq
+    assert summary.calls == [("", ["old user", "old assistant"])]
+    contents = _agent_message_contents(agent)
+    assert contents[0].startswith("Persistent conversation summary")
+    assert "persisted project summary" in contents[0]
+    assert contents[1:] == ["old followup", "new user"]
+
+
 def test_api_chat_can_disable_rag_per_request():
     center = InMemoryUserCenter()
     agent = FakeAgent()
@@ -233,7 +319,7 @@ def test_api_chat_can_disable_rag_per_request():
         configs.append(config)
         return agent
 
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key", rag_mode="tool"),
         user_center=center,
         agent_factory=factory,
@@ -252,7 +338,7 @@ def test_api_chat_can_disable_rag_per_request():
 def test_api_task_flow_creates_task_steps_and_messages() -> None:
     center = InMemoryUserCenter()
     runtime = TaskRuntime(store=InMemoryTaskStore())
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key"),
         user_center=center,
         task_runtime=runtime,
@@ -278,14 +364,14 @@ def test_api_task_flow_creates_task_steps_and_messages() -> None:
     thread_id = cast("str", task["thread_id"])
     messages = center.list_messages(tenant_id=tenant.tenant_id, thread_id=thread_id)
     assert [message.role for message in messages] == ["user", "assistant"]
-    assert messages[0].metadata == {"task_mode": True}
+    assert messages[0].metadata == {"task_id": task["task_id"], "task_mode": True}
     assert messages[1].metadata == {"task_id": task["task_id"], "task_mode": True}
 
 
 def test_api_task_stream_emits_progress_and_persists_messages() -> None:
     center = InMemoryUserCenter()
     runtime = TaskRuntime(store=InMemoryTaskStore())
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key"),
         user_center=center,
         task_runtime=runtime,
@@ -324,7 +410,7 @@ def test_api_chat_stream_emits_status_delta_and_persists_message():
             ("updates", {"agent": {"messages": [AIMessage(content="pong")]}}),
         ]
     )
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key"),
         user_center=center,
         agent_factory=lambda _config, **_kwargs: agent,
@@ -355,7 +441,7 @@ def test_api_chat_stream_emits_status_delta_and_persists_message():
 def test_email_password_register_login_issues_bearer_tokens():
     center = InMemoryUserCenter()
     sample = "correct horse"
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key", tenant_id="default"),
         user_center=center,
         agent_factory=lambda _config, **_kwargs: FakeAgent(),
@@ -388,7 +474,7 @@ def test_knowledge_base_upload_queues_document(tmp_path):
         store=InMemoryKnowledgeBaseStore(),
         indexer=cast("Any", indexer),
     )
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key", upload_dir=str(tmp_path)),
         user_center=center,
         knowledge_service=knowledge,
@@ -445,7 +531,7 @@ def test_knowledge_base_upload_queues_document(tmp_path):
 
 def test_knowledge_base_schema_drift_returns_actionable_error():
     center = InMemoryUserCenter()
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key"),
         user_center=center,
         knowledge_service=cast("Any", SchemaDriftKnowledgeService()),
@@ -470,7 +556,7 @@ def test_knowledge_base_schema_drift_returns_actionable_error():
 def test_logout_and_revoke_token_disable_bearer_tokens():
     center = InMemoryUserCenter()
     sample = "correct horse"
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key", tenant_id="default"),
         user_center=center,
         agent_factory=lambda _config, **_kwargs: FakeAgent(),
@@ -492,7 +578,7 @@ def test_logout_and_revoke_token_disable_bearer_tokens():
 
 
 def test_auth_context_is_not_exposed_as_query_parameter():
-    app = create_app(
+    app = _create_app(
         config=AgentRuntimeConfig(api_admin_key="admin-key"),
         user_center=InMemoryUserCenter(),
         agent_factory=lambda _config, **_kwargs: FakeAgent(),
@@ -528,6 +614,10 @@ def test_auth_context_is_not_exposed_as_query_parameter():
 
 def _endpoint(app, path, method):
     return _route(app, path, method).endpoint
+
+
+def _create_app(**kwargs: Any):
+    return create_app(pending_turn_store=InMemoryPendingTurnStore(), **kwargs)
 
 
 def _route(app, path, method):

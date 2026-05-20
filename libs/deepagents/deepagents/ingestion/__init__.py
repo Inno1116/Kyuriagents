@@ -13,6 +13,7 @@ from deepagents.ingestion.parsers import (
     ParseRequest,
     build_document_parser,
 )
+from deepagents.ingestion.redis_queue import IngestionJobQueue, InMemoryIngestionJobQueue, NoopIngestionJobQueue, RedisIngestionJobQueue
 from deepagents.ingestion.service import KnowledgeBaseService
 from deepagents.ingestion.store import (
     DocumentRecord,
@@ -24,6 +25,8 @@ __all__ = [
     "AutoDocumentParser",
     "DocumentParser",
     "DocumentRecord",
+    "InMemoryIngestionJobQueue",
+    "IngestionJobQueue",
     "IngestionJobRecord",
     "KnowledgeBaseRecord",
     "KnowledgeBaseService",
@@ -32,8 +35,10 @@ __all__ = [
     "LocalPdfTextParser",
     "LocalPlainTextParser",
     "MCPDocumentParser",
+    "NoopIngestionJobQueue",
     "ParseRequest",
     "ParsedDocument",
     "ParsedSection",
+    "RedisIngestionJobQueue",
     "build_document_parser",
 ]

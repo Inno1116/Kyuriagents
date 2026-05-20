@@ -80,6 +80,22 @@ ALTER TABLE IF EXISTS agent_messages
 CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_message_seq_uidx ON agent_messages(message_seq);
 CREATE INDEX IF NOT EXISTS agent_messages_thread_seq_idx ON agent_messages(tenant_id, thread_id, message_seq ASC);
 
+CREATE TABLE IF NOT EXISTS agent_thread_summaries (
+    thread_id TEXT PRIMARY KEY REFERENCES agent_threads(thread_id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL REFERENCES agent_tenants(tenant_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES agent_users(user_id) ON DELETE CASCADE,
+    summary TEXT NOT NULL DEFAULT '',
+    summarized_until_message_seq BIGINT NOT NULL DEFAULT 0,
+    summary_version INTEGER NOT NULL DEFAULT 1 CHECK (summary_version > 0),
+    token_count INTEGER NOT NULL DEFAULT 0 CHECK (token_count >= 0),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS agent_thread_summaries_tenant_user_idx
+    ON agent_thread_summaries(tenant_id, user_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS agent_tasks (
     task_id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES agent_tenants(tenant_id) ON DELETE CASCADE,

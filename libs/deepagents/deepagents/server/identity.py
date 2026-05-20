@@ -142,6 +142,7 @@ class MessageRecord:
     """Persisted chat message."""
 
     message_id: str
+    message_seq: int = 0
     tenant_id: str
     thread_id: str
     role: MessageRole
@@ -149,6 +150,32 @@ class MessageRecord:
     user_id: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     created_at: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class ThreadSummaryRecord:
+    """Persisted rolling summary for one conversation thread."""
+
+    thread_id: str
+    tenant_id: str
+    user_id: str
+    summary: str = ""
+    summarized_until_message_seq: int = 0
+    summary_version: int = 1
+    token_count: int = 0
+    metadata: Mapping[str, object] = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class ThreadSummaryUpdate:
+    """Candidate summary update committed with a successful turn."""
+
+    summary: str
+    summarized_until_message_seq: int
+    token_count: int = 0
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
 
 class UserCenter(Protocol):
@@ -248,6 +275,27 @@ class UserCenter(Protocol):
         """Append one message to a thread."""
         ...
 
+    def append_turn(
+        self,
+        *,
+        tenant_id: str,
+        thread_id: str,
+        user_id: str,
+        user_content: str,
+        assistant_content: str,
+        user_message_id: str | None = None,
+        assistant_message_id: str | None = None,
+        user_metadata: Mapping[str, object] | None = None,
+        assistant_metadata: Mapping[str, object] | None = None,
+        summary_update: ThreadSummaryUpdate | None = None,
+    ) -> tuple[MessageRecord, MessageRecord]:
+        """Append user and assistant messages atomically."""
+        ...
+
+    def get_thread_summary(self, *, tenant_id: str, user_id: str, thread_id: str) -> ThreadSummaryRecord | None:
+        """Load the rolling summary for a thread."""
+        ...
+
     def list_messages(self, *, tenant_id: str, thread_id: str, limit: int = 100) -> list[MessageRecord]:
         """List thread messages."""
         ...
@@ -263,6 +311,8 @@ class InMemoryUserCenter:
         self._api_keys: dict[str, APIKeyRecord] = {}
         self._threads: dict[str, ThreadRecord] = {}
         self._messages: dict[str, MessageRecord] = {}
+        self._message_seq = 0
+        self._summaries: dict[str, ThreadSummaryRecord] = {}
         self._password_hashes: dict[str, str] = {}
 
     def ensure_tenant(self, *, name: str, tenant_id: str, metadata: Mapping[str, object] | None = None) -> TenantRecord:
@@ -473,8 +523,10 @@ class InMemoryUserCenter:
         if thread is None or thread.tenant_id != tenant_id:
             msg = "`thread_id` must belong to the tenant."
             raise ValueError(msg)
+        self._message_seq += 1
         record = MessageRecord(
             message_id=message_id or _id("msg"),
+            message_seq=self._message_seq,
             tenant_id=tenant_id,
             thread_id=thread_id,
             user_id=user_id,
@@ -487,12 +539,85 @@ class InMemoryUserCenter:
         self._threads[thread_id] = replace(thread, updated_at=record.created_at)
         return record
 
+    def append_turn(
+        self,
+        *,
+        tenant_id: str,
+        thread_id: str,
+        user_id: str,
+        user_content: str,
+        assistant_content: str,
+        user_message_id: str | None = None,
+        assistant_message_id: str | None = None,
+        user_metadata: Mapping[str, object] | None = None,
+        assistant_metadata: Mapping[str, object] | None = None,
+        summary_update: ThreadSummaryUpdate | None = None,
+    ) -> tuple[MessageRecord, MessageRecord]:
+        """Append user and assistant messages atomically."""
+        user = self.append_message(
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            role="user",
+            content=user_content,
+            message_id=user_message_id,
+            metadata=user_metadata,
+        )
+        assistant = self.append_message(
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            role="assistant",
+            content=assistant_content,
+            message_id=assistant_message_id,
+            metadata=assistant_metadata,
+        )
+        if summary_update is not None:
+            self._upsert_thread_summary(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                update=summary_update,
+            )
+        return user, assistant
+
+    def get_thread_summary(self, *, tenant_id: str, user_id: str, thread_id: str) -> ThreadSummaryRecord | None:
+        """Load the rolling summary for a thread."""
+        summary = self._summaries.get(thread_id)
+        if summary is None or summary.tenant_id != tenant_id or summary.user_id != user_id:
+            return None
+        return summary
+
     def list_messages(self, *, tenant_id: str, thread_id: str, limit: int = 100) -> list[MessageRecord]:
         """List thread messages."""
         _positive("limit", limit)
         messages = [message for message in self._messages.values() if message.tenant_id == tenant_id and message.thread_id == thread_id]
         messages.sort(key=lambda message: message.created_at)
         return messages[-limit:]
+
+    def _upsert_thread_summary(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        update: ThreadSummaryUpdate,
+    ) -> None:
+        existing = self._summaries.get(thread_id)
+        version = (existing.summary_version + 1) if existing is not None else 1
+        now = _now()
+        self._summaries[thread_id] = ThreadSummaryRecord(
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            summary=update.summary,
+            summarized_until_message_seq=update.summarized_until_message_seq,
+            summary_version=version,
+            token_count=update.token_count,
+            metadata=dict(update.metadata),
+            created_at=existing.created_at if existing is not None else now,
+            updated_at=now,
+        )
 
 
 class PostgresUserCenter:
@@ -847,6 +972,108 @@ class PostgresUserCenter:
             cursor.execute("UPDATE agent_threads SET updated_at = now() WHERE thread_id = %(thread_id)s", {"thread_id": thread_id})
         return _message_from_row(_require_row(row))
 
+    def append_turn(
+        self,
+        *,
+        tenant_id: str,
+        thread_id: str,
+        user_id: str,
+        user_content: str,
+        assistant_content: str,
+        user_message_id: str | None = None,
+        assistant_message_id: str | None = None,
+        user_metadata: Mapping[str, object] | None = None,
+        assistant_metadata: Mapping[str, object] | None = None,
+        summary_update: ThreadSummaryUpdate | None = None,
+    ) -> tuple[MessageRecord, MessageRecord]:
+        """Append user and assistant messages atomically."""
+        user_params = {
+            "message_id": user_message_id or _id("msg"),
+            "tenant_id": tenant_id,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "role": "user",
+            "content": user_content,
+            "metadata": _jsonb(dict(user_metadata or {})),
+        }
+        assistant_params = {
+            "message_id": assistant_message_id or _id("msg"),
+            "tenant_id": tenant_id,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "role": "assistant",
+            "content": assistant_content,
+            "metadata": _jsonb(dict(assistant_metadata or {})),
+        }
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO agent_messages (message_id, tenant_id, thread_id, user_id, role, content, metadata)
+                VALUES (%(message_id)s, %(tenant_id)s, %(thread_id)s, %(user_id)s, %(role)s, %(content)s, %(metadata)s)
+                RETURNING *
+                """,
+                user_params,
+            )
+            user_row = cursor.fetchone()
+            cursor.execute(
+                """
+                INSERT INTO agent_messages (message_id, tenant_id, thread_id, user_id, role, content, metadata)
+                VALUES (%(message_id)s, %(tenant_id)s, %(thread_id)s, %(user_id)s, %(role)s, %(content)s, %(metadata)s)
+                RETURNING *
+                """,
+                assistant_params,
+            )
+            assistant_row = cursor.fetchone()
+            if summary_update is not None:
+                cursor.execute(
+                    """
+                    INSERT INTO agent_thread_summaries (
+                        thread_id, tenant_id, user_id, summary,
+                        summarized_until_message_seq, summary_version, token_count, metadata
+                    )
+                    VALUES (
+                        %(thread_id)s, %(tenant_id)s, %(user_id)s, %(summary)s,
+                        %(summarized_until_message_seq)s, 1, %(token_count)s, %(metadata)s
+                    )
+                    ON CONFLICT (thread_id) DO UPDATE
+                    SET summary = EXCLUDED.summary,
+                        summarized_until_message_seq = EXCLUDED.summarized_until_message_seq,
+                        summary_version = agent_thread_summaries.summary_version + 1,
+                        token_count = EXCLUDED.token_count,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = now()
+                    """,
+                    {
+                        "thread_id": thread_id,
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "summary": summary_update.summary,
+                        "summarized_until_message_seq": summary_update.summarized_until_message_seq,
+                        "token_count": summary_update.token_count,
+                        "metadata": _jsonb(dict(summary_update.metadata)),
+                    },
+                )
+            cursor.execute("UPDATE agent_threads SET updated_at = now() WHERE thread_id = %(thread_id)s", {"thread_id": thread_id})
+        return _message_from_row(_require_row(user_row)), _message_from_row(_require_row(assistant_row))
+
+    def get_thread_summary(self, *, tenant_id: str, user_id: str, thread_id: str) -> ThreadSummaryRecord | None:
+        """Load the rolling summary for a thread."""
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM agent_thread_summaries
+                WHERE tenant_id = %(tenant_id)s
+                  AND user_id = %(user_id)s
+                  AND thread_id = %(thread_id)s
+                """,
+                {"tenant_id": tenant_id, "user_id": user_id, "thread_id": thread_id},
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return _thread_summary_from_row(row)
+
     def list_messages(self, *, tenant_id: str, thread_id: str, limit: int = 100) -> list[MessageRecord]:
         """List thread messages."""
         _positive("limit", limit)
@@ -1095,6 +1322,7 @@ def _thread_from_row(row: Mapping[str, object]) -> ThreadRecord:
 def _message_from_row(row: Mapping[str, object]) -> MessageRecord:
     return MessageRecord(
         message_id=str(row["message_id"]),
+        message_seq=_int_or_zero(row.get("message_seq")),
         tenant_id=str(row["tenant_id"]),
         thread_id=str(row["thread_id"]),
         user_id=_optional_str(row.get("user_id")),
@@ -1105,11 +1333,32 @@ def _message_from_row(row: Mapping[str, object]) -> MessageRecord:
     )
 
 
+def _thread_summary_from_row(row: Mapping[str, object]) -> ThreadSummaryRecord:
+    return ThreadSummaryRecord(
+        thread_id=str(row["thread_id"]),
+        tenant_id=str(row["tenant_id"]),
+        user_id=str(row["user_id"]),
+        summary=str(row.get("summary") or ""),
+        summarized_until_message_seq=_int_or_zero(row.get("summarized_until_message_seq")),
+        summary_version=_int_or_zero(row.get("summary_version")) or 1,
+        token_count=_int_or_zero(row.get("token_count")),
+        metadata=cast("Mapping[str, object]", row.get("metadata") or {}),
+        created_at=str(row.get("created_at", "")),
+        updated_at=str(row.get("updated_at", "")),
+    )
+
+
 def _optional_str(value: object) -> str | None:
     if value is None:
         return None
     text = str(value)
     return text or None
+
+
+def _int_or_zero(value: object) -> int:
+    if value in (None, ""):
+        return 0
+    return int(str(value))
 
 
 __all__ = [
@@ -1122,6 +1371,8 @@ __all__ = [
     "PostgresUserCenter",
     "TenantRecord",
     "ThreadRecord",
+    "ThreadSummaryRecord",
+    "ThreadSummaryUpdate",
     "UserCenter",
     "UserRecord",
     "api_key_prefix",
