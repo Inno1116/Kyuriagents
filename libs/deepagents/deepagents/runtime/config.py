@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 _DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+_DASHSCOPE_RERANK_URL = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -34,6 +35,8 @@ class AgentRuntimeConfig:
         dashscope_api_key: DashScope API key.
         dashscope_base_url: OpenAI-compatible DashScope base URL.
         chat_model: Chat model name.
+        dashscope_enable_thinking: Optional DashScope thinking-mode switch.
+            When set, it is sent as `extra_body.enable_thinking`.
         context_summary_model: Optional cheaper chat model for short-term
             summarization. When omitted, the main chat model is used.
         embedding_model: Embedding model name.
@@ -53,6 +56,10 @@ class AgentRuntimeConfig:
         rag_milvus_db: Optional Milvus database.
         rag_milvus_token: Optional Milvus token.
         rag_kb_ids: Optional default knowledge-base filters.
+        rag_rerank_model: Optional DashScope rerank model. Use `off` in the
+            environment to disable this quality layer.
+        rag_rerank_url: DashScope rerank endpoint URL.
+        rag_rerank_timeout_seconds: DashScope rerank request timeout.
         memory_es_index: Elasticsearch index for memory chunks.
         memory_milvus_collection: Milvus collection for memory vectors.
         memory_checkpoint_interval: Number of user turns between automatic
@@ -83,6 +90,31 @@ class AgentRuntimeConfig:
         tokenizer_local_files_only: Whether tokenization may only use cached files.
         tokenizer_strict: Whether tokenizer loading failures should raise instead
             of falling back to approximate counting.
+        enable_subagents: Whether the main agent should delegate RAG and web
+            research through specialized subagents instead of seeing those raw
+            tools directly.
+        enable_task_graph_runtime: Whether task mode should use the
+            LangGraph-backed planner/executor graph instead of the legacy
+            imperative loop.
+        enable_web_search: Whether to expose public web search tools.
+        searxng_base_url: Base URL for the SearXNG instance.
+        web_search_max_results: Maximum SearXNG results returned to one tool call.
+        web_agent_max_search_calls: Maximum search calls a web subagent should
+            spend on one delegated task.
+        web_search_safe_search: SearXNG safe-search level.
+        web_search_language: Optional SearXNG language code.
+        web_search_fallback_engines: SearXNG engines tried one by one after
+            aggregate search fails or returns no results.
+        web_search_timeout_seconds: Timeout for SearXNG API calls.
+        web_fetch_max_pages: Maximum pages opened by one research tool call.
+        web_fetch_concurrency: Maximum parallel page fetches.
+        web_fetch_retries: Number of retries for SearXNG and HTTP page fetches.
+        web_fetch_timeout_seconds: Timeout for plain HTTP page fetches.
+        web_fetch_max_bytes: Maximum bytes read from one page response.
+        web_fetch_max_chars: Maximum extracted characters returned from one page.
+            This also bounds the text a web subagent can inspect from one page.
+        web_render_max_pages: Maximum pages rendered with Playwright fallback.
+        web_render_timeout_seconds: Timeout for Playwright page rendering.
         api_admin_key: Optional bootstrap key for API admin endpoints.
         auth_token_ttl_days: Number of days before login tokens expire. Use `0`
             for non-expiring tokens in local development.
@@ -120,6 +152,7 @@ class AgentRuntimeConfig:
     dashscope_api_key: str | None = None
     dashscope_base_url: str = _DASHSCOPE_BASE_URL
     chat_model: str = "qwen-plus"
+    dashscope_enable_thinking: bool | None = None
     context_summary_model: str | None = None
     embedding_model: str = "text-embedding-v3"
     embedding_dimensions: int | None = None
@@ -138,6 +171,9 @@ class AgentRuntimeConfig:
     rag_milvus_db: str | None = None
     rag_milvus_token: str | None = None
     rag_kb_ids: tuple[str, ...] = ()
+    rag_rerank_model: str | None = "qwen3-vl-rerank"
+    rag_rerank_url: str = _DASHSCOPE_RERANK_URL
+    rag_rerank_timeout_seconds: float = 10.0
     memory_es_index: str = "memory_chunks"
     memory_milvus_collection: str = "memory_chunks"
     memory_checkpoint_interval: int = 10
@@ -159,6 +195,27 @@ class AgentRuntimeConfig:
     tokenizer_model: str = "Qwen/Qwen3-8B"
     tokenizer_local_files_only: bool = True
     tokenizer_strict: bool = False
+    enable_subagents: bool = False
+    enable_task_graph_runtime: bool = True
+    enable_web_search: bool = False
+    searxng_base_url: str = "http://127.0.0.1:8888"
+    web_search_max_results: int = 8
+    web_search_query_plan_size: int = 3
+    web_search_cache_ttl_seconds: int = 300
+    web_search_rerank_candidates: int = 24
+    web_agent_max_search_calls: int = 3
+    web_search_safe_search: int = 0
+    web_search_language: str = ""
+    web_search_fallback_engines: tuple[str, ...] = ("duckduckgo", "bing", "baidu", "sogou")
+    web_search_timeout_seconds: float = 8.0
+    web_fetch_max_pages: int = 5
+    web_fetch_concurrency: int = 3
+    web_fetch_retries: int = 1
+    web_fetch_timeout_seconds: float = 8.0
+    web_fetch_max_bytes: int = 1_000_000
+    web_fetch_max_chars: int = 3_000
+    web_render_max_pages: int = 3
+    web_render_timeout_seconds: float = 12.0
     api_admin_key: str | None = None
     auth_token_ttl_days: int = 30
     api_cors_origins: tuple[str, ...] = ("http://127.0.0.1:5173", "http://localhost:5173")
@@ -189,6 +246,7 @@ class AgentRuntimeConfig:
         """Validate context window settings."""
         self._validate_summary_config()
         self._validate_runtime_budget_config()
+        self._validate_rag_config()
         if self.upload_max_bytes <= 0:
             msg = "`upload_max_bytes` must be positive."
             raise ValueError(msg)
@@ -241,6 +299,63 @@ class AgentRuntimeConfig:
             raise ValueError(msg)
         if self.max_tool_result_tokens <= 0:
             msg = "`max_tool_result_tokens` must be positive."
+            raise ValueError(msg)
+        self._validate_web_search_config()
+
+    def _validate_rag_config(self) -> None:
+        """Validate RAG-specific runtime settings."""
+        if self.rag_rerank_model and not self.rag_rerank_url:
+            msg = "`rag_rerank_url` must not be empty when rerank is enabled."
+            raise ValueError(msg)
+        if self.rag_rerank_timeout_seconds <= 0:
+            msg = "`rag_rerank_timeout_seconds` must be positive."
+            raise ValueError(msg)
+
+    def _validate_web_search_config(self) -> None:
+        """Validate web search runtime settings."""
+        if not self.searxng_base_url:
+            msg = "`searxng_base_url` must not be empty."
+            raise ValueError(msg)
+        self._validate_web_search_pipeline_config()
+        self._validate_web_fetch_config()
+
+    def _validate_web_search_pipeline_config(self) -> None:
+        """Validate web search query planning and ranking settings."""
+        if self.web_search_max_results <= 0:
+            msg = "`web_search_max_results` must be positive."
+            raise ValueError(msg)
+        if self.web_search_query_plan_size <= 0:
+            msg = "`web_search_query_plan_size` must be positive."
+            raise ValueError(msg)
+        if self.web_search_cache_ttl_seconds < 0:
+            msg = "`web_search_cache_ttl_seconds` must not be negative."
+            raise ValueError(msg)
+        if self.web_search_rerank_candidates <= 0:
+            msg = "`web_search_rerank_candidates` must be positive."
+            raise ValueError(msg)
+        if self.web_agent_max_search_calls <= 0:
+            msg = "`web_agent_max_search_calls` must be positive."
+            raise ValueError(msg)
+        if self.web_search_safe_search < 0:
+            msg = "`web_search_safe_search` must not be negative."
+            raise ValueError(msg)
+
+    def _validate_web_fetch_config(self) -> None:
+        """Validate web page fetch and render settings."""
+        if self.web_search_timeout_seconds <= 0 or self.web_fetch_timeout_seconds <= 0 or self.web_render_timeout_seconds <= 0:
+            msg = "Web search and fetch timeouts must be positive."
+            raise ValueError(msg)
+        if self.web_fetch_retries < 0:
+            msg = "`web_fetch_retries` must not be negative."
+            raise ValueError(msg)
+        if self.web_fetch_max_pages <= 0 or self.web_fetch_concurrency <= 0:
+            msg = "Web page fetch limits must be positive."
+            raise ValueError(msg)
+        if self.web_fetch_max_bytes <= 0 or self.web_fetch_max_chars <= 0:
+            msg = "Web fetch size limits must be positive."
+            raise ValueError(msg)
+        if self.web_render_max_pages < 0:
+            msg = "`web_render_max_pages` must not be negative."
             raise ValueError(msg)
 
     def _validate_ingestion_config(self) -> None:
@@ -295,6 +410,7 @@ class AgentRuntimeConfig:
             dashscope_api_key=_optional_env(source, "DASHSCOPE_API_KEY"),
             dashscope_base_url=_env(source, "DASHSCOPE_BASE_URL", default=_DASHSCOPE_BASE_URL),
             chat_model=_env(source, "DASHSCOPE_CHAT_MODEL", "DEEPAGENTS_CHAT_MODEL", default="qwen-plus"),
+            dashscope_enable_thinking=_optional_bool_env(source, "DASHSCOPE_ENABLE_THINKING", "DEEPAGENTS_DASHSCOPE_ENABLE_THINKING"),
             context_summary_model=_optional_env(source, "DEEPAGENTS_CONTEXT_SUMMARY_MODEL", "DASHSCOPE_CONTEXT_SUMMARY_MODEL"),
             embedding_model=_env(source, "DASHSCOPE_EMBEDDING_MODEL", "DEEPAGENTS_EMBEDDING_MODEL", default="text-embedding-v3"),
             embedding_dimensions=_optional_int_env(source, "DASHSCOPE_EMBEDDING_DIMENSIONS", "DEEPAGENTS_EMBEDDING_DIMENSIONS"),
@@ -313,6 +429,14 @@ class AgentRuntimeConfig:
             rag_milvus_db=_optional_env(source, "RAG_MILVUS_DB"),
             rag_milvus_token=_optional_env(source, "RAG_MILVUS_TOKEN"),
             rag_kb_ids=_tuple_env(source, "RAG_KB_IDS", "DEEPAGENTS_RAG_KB_IDS"),
+            rag_rerank_model=_optional_model_env(
+                source,
+                "DEEPAGENTS_RAG_RERANK_MODEL",
+                "DASHSCOPE_RERANK_MODEL",
+                default="qwen3-vl-rerank",
+            ),
+            rag_rerank_url=_env(source, "DEEPAGENTS_RAG_RERANK_URL", "DASHSCOPE_RERANK_URL", default=_DASHSCOPE_RERANK_URL),
+            rag_rerank_timeout_seconds=_float_env(source, "DEEPAGENTS_RAG_RERANK_TIMEOUT_SECONDS", "DASHSCOPE_RERANK_TIMEOUT_SECONDS", default=10.0),
             memory_es_index=_env(source, "MEMORY_ES_INDEX", default="memory_chunks"),
             memory_milvus_collection=_env(source, "MEMORY_MILVUS_COLLECTION", default="memory_chunks"),
             memory_checkpoint_interval=_int_env(source, "DEEPAGENTS_MEMORY_CHECKPOINT_INTERVAL", default=10),
@@ -334,6 +458,27 @@ class AgentRuntimeConfig:
             tokenizer_model=_env(source, "QWEN_TOKENIZER_MODEL", "KYURI_TOKENIZER_MODEL", default="Qwen/Qwen3-8B"),
             tokenizer_local_files_only=_bool_env(source, "QWEN_TOKENIZER_LOCAL_FILES_ONLY", default=True),
             tokenizer_strict=_bool_env(source, "QWEN_TOKENIZER_STRICT", default=False),
+            enable_subagents=_bool_env(source, "DEEPAGENTS_ENABLE_SUBAGENTS", "KYURI_ENABLE_SUBAGENTS", default=False),
+            enable_task_graph_runtime=_bool_env(source, "DEEPAGENTS_ENABLE_TASK_GRAPH_RUNTIME", "KYURI_ENABLE_TASK_GRAPH_RUNTIME", default=True),
+            enable_web_search=_bool_env(source, "DEEPAGENTS_ENABLE_WEB_SEARCH", "KYURI_ENABLE_WEB_SEARCH", default=False),
+            searxng_base_url=_env(source, "SEARXNG_BASE_URL", "DEEPAGENTS_SEARXNG_BASE_URL", default="http://127.0.0.1:8888"),
+            web_search_max_results=_int_env(source, "DEEPAGENTS_WEB_SEARCH_MAX_RESULTS", default=8),
+            web_search_query_plan_size=_int_env(source, "DEEPAGENTS_WEB_SEARCH_QUERY_PLAN_SIZE", default=3),
+            web_search_cache_ttl_seconds=_int_env(source, "DEEPAGENTS_WEB_SEARCH_CACHE_TTL_SECONDS", default=300),
+            web_search_rerank_candidates=_int_env(source, "DEEPAGENTS_WEB_SEARCH_RERANK_CANDIDATES", default=24),
+            web_agent_max_search_calls=_int_env(source, "DEEPAGENTS_WEB_AGENT_MAX_SEARCH_CALLS", "KYURI_WEB_AGENT_MAX_SEARCH_CALLS", default=3),
+            web_search_safe_search=_int_env(source, "DEEPAGENTS_WEB_SEARCH_SAFE_SEARCH", default=0),
+            web_search_language=_env(source, "DEEPAGENTS_WEB_SEARCH_LANGUAGE", default=""),
+            web_search_fallback_engines=_tuple_env(source, "DEEPAGENTS_WEB_SEARCH_FALLBACK_ENGINES") or ("duckduckgo", "bing", "baidu", "sogou"),
+            web_search_timeout_seconds=_float_env(source, "DEEPAGENTS_WEB_SEARCH_TIMEOUT_SECONDS", default=8.0),
+            web_fetch_max_pages=_int_env(source, "DEEPAGENTS_WEB_FETCH_MAX_PAGES", default=5),
+            web_fetch_concurrency=_int_env(source, "DEEPAGENTS_WEB_FETCH_CONCURRENCY", default=3),
+            web_fetch_retries=_int_env(source, "DEEPAGENTS_WEB_FETCH_RETRIES", default=1),
+            web_fetch_timeout_seconds=_float_env(source, "DEEPAGENTS_WEB_FETCH_TIMEOUT_SECONDS", default=8.0),
+            web_fetch_max_bytes=_int_env(source, "DEEPAGENTS_WEB_FETCH_MAX_BYTES", default=1_000_000),
+            web_fetch_max_chars=_int_env(source, "DEEPAGENTS_WEB_FETCH_MAX_CHARS", default=3_000),
+            web_render_max_pages=_int_env(source, "DEEPAGENTS_WEB_RENDER_MAX_PAGES", default=3),
+            web_render_timeout_seconds=_float_env(source, "DEEPAGENTS_WEB_RENDER_TIMEOUT_SECONDS", default=12.0),
             api_admin_key=_optional_env(source, "DEEPAGENTS_API_ADMIN_KEY"),
             auth_token_ttl_days=_int_env(source, "DEEPAGENTS_AUTH_TOKEN_TTL_DAYS", default=30),
             api_cors_origins=_tuple_env(source, "DEEPAGENTS_API_CORS_ORIGINS") or ("http://127.0.0.1:5173", "http://localhost:5173"),
@@ -413,7 +558,7 @@ class AgentRuntimeConfig:
             thread_id=self.thread_id,
         )
 
-    def context_summary_trigger(self) -> tuple[Literal["tokens", "messages"], int] | None:
+    def context_summary_trigger(self) -> tuple[Literal["tokens"], int] | tuple[Literal["messages"], int] | None:
         """Return the short-term summarization trigger for Deep Agents."""
         if self.context_summary_trigger_tokens > 0:
             return ("tokens", self.context_summary_trigger_tokens)
@@ -442,11 +587,35 @@ def _optional_env(source: Mapping[str, str], *names: str) -> str | None:
     return None
 
 
-def _bool_env(source: Mapping[str, str], name: str, *, default: bool) -> bool:
-    value = source.get(name)
+def _optional_model_env(source: Mapping[str, str], *names: str, default: str | None) -> str | None:
+    for name in names:
+        if name not in source:
+            continue
+        value = source[name].strip()
+        if value.lower() in {"", "0", "false", "none", "off"}:
+            return None
+        return value
+    return default
+
+
+def _bool_env(source: Mapping[str, str], *names: str, default: bool) -> bool:
+    value = _optional_env(source, *names)
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_bool_env(source: Mapping[str, str], *names: str) -> bool | None:
+    value = _optional_env(source, *names)
+    if value is None:
+        return None
+    normalized = value.lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    msg = f"Boolean environment value must be true/false, got `{value}`."
+    raise ValueError(msg)
 
 
 def _optional_int_env(source: Mapping[str, str], *names: str) -> int | None:

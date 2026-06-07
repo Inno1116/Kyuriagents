@@ -241,6 +241,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     system_prompt: str | SystemMessage | None = None,
     middleware: Sequence[AgentMiddleware] = (),
     subagents: Sequence[SubAgent | CompiledSubAgent | AsyncSubAgent] | None = None,
+    general_purpose_subagent: GeneralPurposeSubagentProfile | None = None,
     skills: list[str] | None = None,
     memory: list[str] | None = None,
     permissions: list[FilesystemPermission] | None = None,
@@ -405,6 +406,10 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             `general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)`
             — the `task` tool is not exposed. Async subagents are independent.
 
+        general_purpose_subagent: Optional direct override for the default
+            general-purpose subagent. Use this to disable or customize the
+            default subagent without registering a model-specific harness
+            profile.
         skills: List of skill source paths (e.g., `["/skills/user/", "/skills/project/"]`).
 
             Paths must be specified using POSIX conventions (forward slashes)
@@ -654,7 +659,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     # is how callers override the default. Skipping in those cases also avoids
     # invoking factory-based `extra_middleware` whose output would be thrown
     # away.
-    gp_profile = _profile.general_purpose_subagent or GeneralPurposeSubagentProfile()
+    gp_profile = general_purpose_subagent or _profile.general_purpose_subagent or GeneralPurposeSubagentProfile()
     if gp_profile.enabled is not False and not any(spec["name"] == GENERAL_PURPOSE_SUBAGENT["name"] for spec in inline_subagents):
         gp_middleware: list[AgentMiddleware[Any, Any, Any]] = [
             TodoListMiddleware(),

@@ -7,8 +7,10 @@ from typing import TYPE_CHECKING, cast
 from deepagents.graph import create_deep_agent
 from deepagents.memory import ElasticsearchMilvusMemoryIndexer, MemoryHybridSearcher, MemoryService, PostgresMemoryStore
 from deepagents.middleware.retrieval import RetrievalMiddleware
-from deepagents.rag import ElasticsearchKeywordStore, HybridRAGRetriever, MilvusVectorStore
+from deepagents.profiles.harness.harness_profiles import GeneralPurposeSubagentProfile
+from deepagents.rag import DashScopeTextReranker, ElasticsearchKeywordStore, HybridRAGRetriever, MilvusVectorStore, PostgresChunkTextHydrator
 from deepagents.runtime.dashscope import EmbedQuery, create_dashscope_embed_query, create_dashscope_model
+from deepagents.runtime.evidence import EvidencePackage
 from deepagents.runtime.mcp import LoadedMCPTools, load_mcp_tools
 from deepagents.tools import (
     PostgresToolAuditSink,
@@ -20,6 +22,7 @@ from deepagents.tools import (
     default_tool_registry,
     merge_tool_sequences,
 )
+from deepagents.websearch import create_web_agent_tools, create_web_search_tools, web_search_tool_descriptors
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -31,6 +34,7 @@ if TYPE_CHECKING:
     from langgraph.store.base import BaseStore
     from langgraph.types import Checkpointer
 
+    from deepagents.middleware.subagents import SubAgent
     from deepagents.runtime.config import AgentRuntimeConfig
 
 
@@ -99,24 +103,51 @@ def create_kyuri_agent(
         resolved_checkpointer = resolved_checkpointer or pg_checkpointer
         resolved_store = resolved_store or pg_store
 
+    use_information_subagents = config.enable_subagents and (config.enable_rag or config.enable_web_search)
+    main_rag_mode = "off" if use_information_subagents and config.enable_rag else config.rag_mode
     retrieval = RetrievalMiddleware(
         rag_retriever=rag_retriever if config.enable_rag else None,
         memory_service=memory_service if config.enable_memory else None,
-        rag_mode=config.rag_mode,
+        rag_mode=main_rag_mode,
         memory_mode=config.memory_mode,
         defaults=config.retrieval_defaults(),
         memory_checkpoint_interval=config.memory_checkpoint_interval,
         memory_checkpoint_max_chars=config.memory_checkpoint_max_chars,
     )
+    rag_subagent_tools: Sequence[BaseTool] = ()
+    if use_information_subagents and config.enable_rag and rag_retriever is not None:
+        rag_subagent_retrieval = RetrievalMiddleware(
+            rag_retriever=rag_retriever,
+            memory_service=None,
+            rag_mode="tool",
+            memory_mode="off",
+            defaults=config.retrieval_defaults(),
+            memory_checkpoint_interval=0,
+        )
+        rag_subagent_tools = rag_subagent_retrieval.tools
+    web_subagent_tools = create_web_agent_tools(config) if use_information_subagents and config.enable_web_search else ()
+    runtime_web_tools = create_web_search_tools(config) if config.enable_web_search and not use_information_subagents else ()
     resolved_tools, governance = _build_tool_runtime(
         config,
         native_tools=tools,
-        middleware_tools=retrieval.tools,
+        runtime_tools=runtime_web_tools,
+        runtime_descriptors=web_search_tool_descriptors(
+            timeout_seconds=max(1, int(max(config.web_search_timeout_seconds, config.web_fetch_timeout_seconds, config.web_render_timeout_seconds)))
+        )
+        if config.enable_web_search
+        else (),
+        middleware_tools=(*retrieval.tools, *rag_subagent_tools),
         tool_registry=tool_registry,
         tool_policy=tool_policy,
         tool_audit_sink=tool_audit_sink,
         mcp_tools=mcp_tools,
         mcp_descriptors=mcp_descriptors,
+    )
+    information_subagents = _build_information_subagents(
+        config,
+        rag_tools=rag_subagent_tools,
+        web_tools=web_subagent_tools,
+        governance=governance,
     )
     resolved_middleware = [*middleware, retrieval]
     if governance is not None:
@@ -127,6 +158,8 @@ def create_kyuri_agent(
         tools=resolved_tools,
         system_prompt=system_prompt,
         middleware=resolved_middleware,
+        subagents=information_subagents or None,
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False) if use_information_subagents else None,
         checkpointer=resolved_checkpointer,
         store=resolved_store,
         enable_summarization=config.enable_context_summarization,
@@ -136,6 +169,101 @@ def create_kyuri_agent(
         debug=debug,
         name=name,
     )
+
+
+def _build_information_subagents(
+    config: AgentRuntimeConfig,
+    *,
+    rag_tools: Sequence[BaseTool],
+    web_tools: Sequence[BaseTool],
+    governance: ToolGovernanceMiddleware | None,
+) -> list[SubAgent]:
+    subagents: list[SubAgent] = []
+    if rag_tools:
+        rag_agent: SubAgent = {
+            "name": "rag-agent",
+            "description": (
+                "Use only for uploaded documents, private knowledge bases, or indexed local corpora. "
+                "Do not use for public web research, current events, URLs, official websites, anime databases, "
+                "Bangumi, Douban, Bilibili, MoeGirl, or other online facts; use web-agent for those."
+            ),
+            "system_prompt": _rag_agent_prompt(),
+            "tools": rag_tools,
+            "middleware": _subagent_governance_middleware(governance),
+            "response_format": EvidencePackage,
+        }
+        subagents.append(rag_agent)
+    if web_tools:
+        web_agent: SubAgent = {
+            "name": "web-agent",
+            "description": (
+                "Use for public internet research, current or recently changed facts, official web sources, URLs, "
+                "web pages, Chinese web sources, anime/media databases, community encyclopedias, Bangumi, Douban, "
+                "Bilibili, MoeGirl, and any task that asks whether something exists online."
+            ),
+            "system_prompt": _web_agent_prompt(config),
+            "tools": web_tools,
+            "middleware": _subagent_governance_middleware(governance),
+            "response_format": EvidencePackage,
+        }
+        subagents.append(web_agent)
+    return subagents
+
+
+def _subagent_governance_middleware(governance: ToolGovernanceMiddleware | None) -> list[AgentMiddleware]:
+    return cast("list[AgentMiddleware]", [governance] if governance is not None else [])
+
+
+def _rag_agent_prompt() -> str:
+    return """You are Kyuriagents' RAG evidence agent.
+
+Your job is to verify the delegated question against the configured knowledge base and return a compact evidence package.
+
+Rules:
+- Use `search_knowledge_base` before making factual claims from uploaded or indexed documents.
+- If the delegated task asks for public web research, URLs, current events, online communities, or public websites,
+  do not pretend the local knowledge base can answer it. Record that the task should be delegated to `web-agent`
+  in `missing` or `failures`.
+- Rewrite the query when useful, but keep searches focused.
+- Prefer concise, source-backed findings over broad summaries.
+- Do not invent sources. If retrieval is empty or ambiguous, record that in `missing` or `failures`.
+- Return only the structured evidence package requested by the response schema.
+
+Evidence guidance:
+- `conclusion` should be the shortest answer supported by the retrieved chunks.
+- `findings` should be atomic claims.
+- `sources` should include the document title/source URI or chunk identifier when available.
+- `quote` should be a short supporting excerpt, not a full chunk."""
+
+
+def _web_agent_prompt(config: AgentRuntimeConfig) -> str:
+    return f"""You are Kyuriagents' web evidence agent.
+
+Your job is to search the public web, decide which pages are worth opening, and return a compact evidence package for the main agent.
+
+Research policy:
+- Use `web_search` for search result discovery. Spend at most {config.web_agent_max_search_calls} search calls for one delegated task.
+- Preserve the user's original language in at least one search query. For Chinese questions, search Chinese terms first,
+  then add English queries only when they improve source coverage.
+- Deduplicate URLs before fetching pages.
+- Use `web_fetch_static` first for page reading. Open at most {config.web_fetch_max_pages} pages with static fetch.
+- Static and rendered page tools return Markdown with `Quality flags`, text length, truncation status, and extracted content.
+- Use `web_render_page` only when static fetch reports `empty_text`, `too_short`, `maybe_js_required`, `blocked_or_verification`,
+  or when the extracted content clearly misses dynamic content needed for the delegated question.
+- Render at most {config.web_render_max_pages} pages.
+- Each fetched page is already capped at about {config.web_fetch_max_chars} extracted characters; summarize and quote only the useful parts.
+- Prefer official, primary, or high-authority sources. Avoid low-value mirrors when better sources exist.
+- Do not treat generic homepages, topic landing pages, dictionaries, or unrelated portal pages as evidence for a specific claim.
+- Record blocked pages, timeouts, and weak evidence in `failures` or `missing`.
+
+Output rules:
+- Return only the structured evidence package requested by the response schema.
+- `conclusion` should directly answer the delegated research task.
+- Do not claim that no public information exists unless multiple targeted searches and fetched pages directly support that absence.
+  Otherwise say that the search was inconclusive and list what is missing.
+- `findings` should be evidence-backed and concise.
+- `sources` should include title, URL, source_type=`web`, and a short quote.
+- Do not include raw page dumps or long excerpts."""
 
 
 def _create_summarization_model(config: AgentRuntimeConfig) -> BaseChatModel | None:
@@ -157,6 +285,25 @@ def _create_rag_retriever(config: AgentRuntimeConfig, embed_query: EmbedQuery) -
             index=config.rag_es_index,
             url=config.rag_es_url,
         ),
+        chunk_hydrator=_create_rag_chunk_hydrator(config),
+        reranker=_create_rag_reranker(config),
+    )
+
+
+def _create_rag_chunk_hydrator(config: AgentRuntimeConfig) -> PostgresChunkTextHydrator | None:
+    if not config.postgres_dsn:
+        return None
+    return PostgresChunkTextHydrator(dsn=config.postgres_dsn)
+
+
+def _create_rag_reranker(config: AgentRuntimeConfig) -> DashScopeTextReranker | None:
+    if not config.rag_rerank_model:
+        return None
+    return DashScopeTextReranker(
+        api_key=config.dashscope_api_key or "",
+        model=config.rag_rerank_model,
+        endpoint=config.rag_rerank_url,
+        timeout_seconds=config.rag_rerank_timeout_seconds,
     )
 
 
@@ -208,6 +355,8 @@ def _build_tool_runtime(
     config: AgentRuntimeConfig,
     *,
     native_tools: Sequence[BaseTool | Callable | dict[str, Any]] | None,
+    runtime_tools: Sequence[BaseTool | Callable | dict[str, Any]],
+    runtime_descriptors: Sequence[ToolDescriptor],
     middleware_tools: Sequence[BaseTool],
     tool_registry: ToolRegistry | None,
     tool_policy: ToolPolicy | None,
@@ -228,8 +377,11 @@ def _build_tool_runtime(
 
     for tool in native_tools or ():
         _register_tool_if_missing(registry, tool)
+    for tool in runtime_tools:
+        _register_tool_if_missing(registry, tool, source="runtime")
     for tool in middleware_tools:
         _register_tool_if_missing(registry, tool, source="runtime")
+    registry.register_many(runtime_descriptors, replace_existing=True)
     registry.register_many(resolved_mcp_descriptors, replace_existing=True)
 
     governance = None
@@ -244,7 +396,7 @@ def _build_tool_runtime(
             defaults=config.tool_defaults(),
         )
 
-    return merge_tool_sequences(native_tools, resolved_mcp_tools), governance
+    return merge_tool_sequences(native_tools, runtime_tools, resolved_mcp_tools), governance
 
 
 def _register_tool_if_missing(

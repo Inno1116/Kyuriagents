@@ -113,6 +113,54 @@ def test_create_kyuri_agent_adds_preloaded_mcp_tools() -> None:
     assert "status_lookup" in agent.nodes["tools"].bound._tools_by_name
 
 
+def test_create_kyuri_agent_adds_web_search_tools_when_enabled() -> None:
+    model = GenericFakeChatModel(messages=iter([AIMessage(content="Done.")]))
+    config = AgentRuntimeConfig(
+        enable_rag=False,
+        enable_memory=False,
+        enable_checkpointer=False,
+        enable_web_search=True,
+    )
+
+    with patch("deepagents.runtime.factory.create_deep_agent", return_value=MagicMock()) as mock_create:
+        create_kyuri_agent(config, model=model)
+
+    tools = mock_create.call_args.kwargs["tools"]
+    names = {tool.name for tool in tools}
+    assert {"web_search", "web_research", "web_fetch_page"} <= names
+
+
+def test_create_kyuri_agent_routes_rag_and_web_through_information_subagents() -> None:
+    model = GenericFakeChatModel(messages=iter([AIMessage(content="Done.")]))
+    config = AgentRuntimeConfig(
+        tenant_id="tenant-a",
+        user_id="user-1",
+        enable_memory=False,
+        enable_checkpointer=False,
+        enable_web_search=True,
+        enable_subagents=True,
+    )
+
+    with patch("deepagents.runtime.factory.create_deep_agent", return_value=MagicMock()) as mock_create:
+        create_kyuri_agent(config, model=model, rag_retriever=_retriever())
+
+    kwargs = mock_create.call_args.kwargs
+    assert kwargs["general_purpose_subagent"].enabled is False
+    assert {tool.name for tool in kwargs["tools"]} == set()
+
+    subagents = {subagent["name"]: subagent for subagent in kwargs["subagents"]}
+    assert set(subagents) == {"rag-agent", "web-agent"}
+    assert {tool.name for tool in subagents["rag-agent"]["tools"]} == {"search_knowledge_base"}
+    assert {tool.name for tool in subagents["web-agent"]["tools"]} == {"web_search", "web_fetch_static", "web_render_page"}
+    assert "Do not use for public web research" in subagents["rag-agent"]["description"]
+    assert "use web-agent" in subagents["rag-agent"]["description"]
+    assert "whether something exists online" in subagents["web-agent"]["description"]
+    assert "should be delegated to `web-agent`" in subagents["rag-agent"]["system_prompt"]
+    assert "Preserve the user's original language" in subagents["web-agent"]["system_prompt"]
+    assert "Do not treat generic homepages" in subagents["web-agent"]["system_prompt"]
+    assert "Do not claim that no public information exists" in subagents["web-agent"]["system_prompt"]
+
+
 def test_create_kyuri_agent_passes_context_summarization_settings() -> None:
     model = GenericFakeChatModel(messages=iter([AIMessage(content="Done.")]))
     config = AgentRuntimeConfig(
@@ -120,6 +168,7 @@ def test_create_kyuri_agent_passes_context_summarization_settings() -> None:
         enable_memory=False,
         enable_checkpointer=False,
         enable_context_summarization=True,
+        context_summary_trigger_tokens=0,
         context_summary_trigger_messages=32,
         context_summary_keep_messages=10,
     )

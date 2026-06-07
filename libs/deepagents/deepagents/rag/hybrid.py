@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
@@ -12,7 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from deepagents.rag.metadata import RetrievalScope
-    from deepagents.rag.types import KeywordSearcher, Reranker, RetrievedChunk, VectorSearcher
+    from deepagents.rag.types import ChunkHydrator, KeywordSearcher, Reranker, RetrievedChunk, VectorSearcher
 
 _DEFAULT_VECTOR_CANDIDATES = 50
 _DEFAULT_KEYWORD_CANDIDATES = 50
@@ -20,6 +21,7 @@ _DEFAULT_RERANK_CANDIDATES = 80
 _DEFAULT_TOP_K = 5
 _DEFAULT_RRF_K = 60
 _DEFAULT_WEIGHT = 1.0
+_LOGGER = logging.getLogger(__name__)
 
 _SearchKind = Literal["vector", "keyword"]
 
@@ -82,6 +84,7 @@ class HybridRAGRetriever:
         keyword_searcher: KeywordSearcher,
         query_rewriter: QueryRewriter | None = None,
         reranker: Reranker | None = None,
+        chunk_hydrator: ChunkHydrator | None = None,
         config: HybridSearchConfig | None = None,
     ) -> None:
         """Initialize the retriever.
@@ -91,12 +94,14 @@ class HybridRAGRetriever:
             keyword_searcher: Keyword search adapter.
             query_rewriter: Optional query rewriter.
             reranker: Optional reranker.
+            chunk_hydrator: Optional source-of-truth text hydrator.
             config: Optional retrieval configuration.
         """
         self._vector_searcher = vector_searcher
         self._keyword_searcher = keyword_searcher
         self._query_rewriter = query_rewriter or IdentityQueryRewriter()
         self._reranker = reranker or FusedScoreReranker()
+        self._chunk_hydrator = chunk_hydrator
         self._config = config or HybridSearchConfig()
 
     def retrieve(
@@ -147,12 +152,22 @@ class HybridRAGRetriever:
             )
 
         fused = self._fuse(ranked_lists)
-        rerank_input = fused[: self._config.rerank_candidates]
+        hydrated = self._hydrate(fused)
+        rerank_input = hydrated[: self._config.rerank_candidates]
         return self._reranker.rerank(
             rewrite.rewritten_query,
             rerank_input,
             limit=final_limit,
         )
+
+    def _hydrate(self, candidates: list[RetrievedChunk]) -> list[RetrievedChunk]:
+        if self._chunk_hydrator is None:
+            return candidates
+        try:
+            return self._chunk_hydrator.hydrate(candidates)
+        except Exception as exc:  # noqa: BLE001  # Retrieval can still use ES text or metadata if hydration is temporarily down.
+            _LOGGER.warning("RAG chunk hydration failed; continuing with raw retrieval hits: %s", exc)
+            return candidates
 
     def _resolve_top_k(self, top_k: int | None) -> int:
         final_limit = self._config.top_k if top_k is None else top_k

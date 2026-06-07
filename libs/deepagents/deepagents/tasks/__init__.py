@@ -1,5 +1,14 @@
 """Task-mode planning and execution runtime."""
 
+from deepagents.tasks.evidence import (
+    EvidenceAgent,
+    EvidenceRequest,
+    RAGEvidenceAgent,
+    WebEvidenceAgent,
+    create_evidence_agents,
+    format_evidence_package,
+)
+from deepagents.tasks.graph_runtime import ClarificationDecision, ClarificationJudge, GraphTaskRuntime
 from deepagents.tasks.runtime import (
     ContextBuilder,
     IntentRouter,
@@ -26,7 +35,12 @@ from deepagents.tasks.types import (
 )
 
 __all__ = [
+    "ClarificationDecision",
+    "ClarificationJudge",
     "ContextBuilder",
+    "EvidenceAgent",
+    "EvidenceRequest",
+    "GraphTaskRuntime",
     "InMemoryTaskStore",
     "IntentRouter",
     "LLMPlanner",
@@ -34,6 +48,7 @@ __all__ = [
     "PlanValidator",
     "PlannedStep",
     "PostgresTaskStore",
+    "RAGEvidenceAgent",
     "StepObservation",
     "TaskContext",
     "TaskEventRecord",
@@ -47,5 +62,8 @@ __all__ = [
     "TaskStore",
     "TaskToolExecutor",
     "ValidationResult",
+    "WebEvidenceAgent",
+    "create_evidence_agents",
+    "format_evidence_package",
     "heuristic_plan",
 ]

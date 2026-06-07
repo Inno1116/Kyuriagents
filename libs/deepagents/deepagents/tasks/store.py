@@ -59,6 +59,7 @@ class TaskStore(Protocol):
         self,
         task_id: str,
         *,
+        goal: str | None = None,
         status: TaskStatus | None = None,
         intent: TaskIntent | None = None,
         final_answer: str | None = None,
@@ -158,6 +159,7 @@ class InMemoryTaskStore:
         self,
         task_id: str,
         *,
+        goal: str | None = None,
         status: TaskStatus | None = None,
         intent: TaskIntent | None = None,
         final_answer: str | None = None,
@@ -169,6 +171,7 @@ class InMemoryTaskStore:
         task = self._tasks[task_id]
         updated = replace(
             task,
+            goal=task.goal if goal is None else goal,
             status=status or task.status,
             intent=intent or task.intent,
             final_answer=task.final_answer if final_answer is None else final_answer,
@@ -313,6 +316,7 @@ class PostgresTaskStore:
         self,
         task_id: str,
         *,
+        goal: str | None = None,
         status: TaskStatus | None = None,
         intent: TaskIntent | None = None,
         final_answer: str | None = None,
@@ -325,7 +329,8 @@ class PostgresTaskStore:
             cursor.execute(
                 """
                 UPDATE agent_tasks
-                SET status = COALESCE(%(status)s, status),
+                SET goal = COALESCE(%(goal)s, goal),
+                    status = COALESCE(%(status)s, status),
                     intent = COALESCE(%(intent)s, intent),
                     final_answer = COALESCE(%(final_answer)s, final_answer),
                     error_message = %(error_message)s,
@@ -337,6 +342,7 @@ class PostgresTaskStore:
                 """,
                 {
                     "task_id": task_id,
+                    "goal": goal,
                     "status": status,
                     "intent": intent,
                     "final_answer": final_answer,

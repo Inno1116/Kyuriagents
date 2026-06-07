@@ -898,23 +898,30 @@ class PostgresKnowledgeBaseStore:
         with self._cursor() as cursor:
             for chunk in chunks:
                 values = dict(chunk)
+                values["chunk_text"] = str(values.get("chunk_text") or "")
                 values["tags"] = _jsonb(values.get("tags") or [])
                 cursor.execute(
                     """
                     INSERT INTO rag_chunks (
                         chunk_id, tenant_id, kb_id, doc_id, doc_version, user_id, chunk_index,
-                        content_hash, source_type, source_uri, title, section_path, page_start,
+                        content_hash, chunk_text, source_type, source_uri, title, section_path, page_start,
                         page_end, char_start, char_end, language, tags, visibility,
                         embedding_model, embedding_version, schema_version, is_active
                     )
                     VALUES (
                         %(chunk_id)s, %(tenant_id)s, %(kb_id)s, %(doc_id)s, %(doc_version)s, %(user_id)s, %(chunk_index)s,
-                        %(content_hash)s, %(source_type)s, %(source_uri)s, %(title)s, %(section_path)s, %(page_start)s,
+                        %(content_hash)s, %(chunk_text)s, %(source_type)s, %(source_uri)s, %(title)s, %(section_path)s, %(page_start)s,
                         %(page_end)s, %(char_start)s, %(char_end)s, %(language)s, %(tags)s, %(visibility)s,
                         %(embedding_model)s, %(embedding_version)s, %(schema_version)s, %(is_active)s
                     )
                     ON CONFLICT (chunk_id) DO UPDATE
-                    SET is_active = EXCLUDED.is_active, updated_at = now()
+                    SET chunk_text = EXCLUDED.chunk_text,
+                        title = EXCLUDED.title,
+                        section_path = EXCLUDED.section_path,
+                        tags = EXCLUDED.tags,
+                        visibility = EXCLUDED.visibility,
+                        is_active = EXCLUDED.is_active,
+                        updated_at = now()
                     """,
                     values,
                 )

@@ -104,6 +104,8 @@ _DEFAULT_API_SYSTEM_PROMPT = """You are Kyuriagents, a careful agent with access
 
 Answer the user's question directly and in the user's language unless they ask otherwise.
 When retrieved knowledge-base or memory context is available, ground your answer in that context and prefer concrete dates, names, and facts.
+When web search results are available, cite source titles or URLs and distinguish current web evidence from local knowledge.
+Do not use web search to locate pirated, leaked, cracked, or unauthorized download resources.
 For comparison questions, state the conclusion first, then give the supporting facts.
 Do not narrate internal reasoning, do not say what the user "appears to be asking", and do not mention search mechanics unless the user asks.
 If the available context is insufficient, say so briefly and name the missing information.
@@ -182,6 +184,7 @@ class ChatRequest(BaseModel):
     thread_id: str | None = None
     title: str = ""
     rag_enabled: bool | None = None
+    web_search_enabled: bool | None = None
 
 
 class TaskCreateRequest(BaseModel):
@@ -192,6 +195,16 @@ class TaskCreateRequest(BaseModel):
     title: str = ""
     intent: Literal["chat", "task", "rag_query", "memory_query", "clarify", "unsafe"] | None = "task"
     rag_enabled: bool | None = None
+    web_search_enabled: bool | None = None
+
+
+class TaskResumeRequest(BaseModel):
+    """Request body for resuming a task waiting for human input."""
+
+    message: str
+    intent: Literal["chat", "task", "rag_query", "memory_query", "clarify", "unsafe"] | None = "task"
+    rag_enabled: bool | None = None
+    web_search_enabled: bool | None = None
 
 
 class RecordResponse(BaseModel):
@@ -624,7 +637,7 @@ def _register_task_routes(
             title=request.title,
             messages=history,
             forced_intent=request.intent,
-            disabled_tools=("search_knowledge_base",) if request.rag_enabled is False else (),
+            disabled_tools=_disabled_tools_for_request(request),
         )
         if result.final_answer:
             user_center.append_turn(
@@ -639,6 +652,7 @@ def _register_task_routes(
         return RecordResponse(data=_task_payload(result))
 
     _register_task_stream_route(app=app, config=config, user_center=user_center, task_runtime=task_runtime, auth_dependency=auth_dependency)
+    _register_task_resume_routes(app=app, config=config, user_center=user_center, task_runtime=task_runtime, auth_dependency=auth_dependency)
 
     @app.get("/v1/tasks", response_model=RecordResponse)
     def list_tasks(context: AuthContext = auth_dependency, limit: int = 50) -> RecordResponse:
@@ -669,6 +683,72 @@ def _register_task_routes(
         cancelled = task_runtime.store.update_task(task.task_id, status="cancelled", finished=True)
         task_runtime.store.add_event(task_id=task.task_id, event_type="cancelled", message="Task cancelled.")
         return RecordResponse(data=_record_dict(cancelled))
+
+
+def _register_task_resume_routes(
+    *,
+    app: FastAPI,
+    config: AgentRuntimeConfig,
+    user_center: UserCenter,
+    task_runtime: TaskRuntime,
+    auth_dependency: AuthContext,
+) -> None:
+    """Register task human-in-the-loop resume endpoints."""
+
+    @app.post("/v1/tasks/{task_id}/resume", response_model=RecordResponse)
+    def resume_task(task_id: str, request: TaskResumeRequest, context: AuthContext = auth_dependency) -> RecordResponse:
+        task, history = _prepare_task_resume(
+            config=config,
+            user_center=user_center,
+            task_runtime=task_runtime,
+            context=context,
+            task_id=task_id,
+            request=request,
+        )
+        result = task_runtime.run_existing_task(
+            task=task,
+            messages=history,
+            forced_intent=request.intent,
+            disabled_tools=_disabled_tools_for_request(request),
+        )
+        if result.final_answer:
+            user_center.append_turn(
+                tenant_id=context.tenant.tenant_id,
+                thread_id=task.thread_id,
+                user_id=context.user.user_id,
+                user_content=request.message,
+                assistant_content=result.final_answer,
+                user_metadata={"task_id": result.task.task_id, "task_mode": True, "task_resume": True},
+                assistant_metadata={"task_id": result.task.task_id, "task_mode": True, "task_resume": True},
+            )
+        return RecordResponse(data=_task_payload(result))
+
+    @app.post("/v1/tasks/{task_id}/resume/stream")
+    def resume_task_stream(task_id: str, request: TaskResumeRequest, context: AuthContext = auth_dependency) -> StreamingResponse:
+        task, history = _prepare_task_resume(
+            config=config,
+            user_center=user_center,
+            task_runtime=task_runtime,
+            context=context,
+            task_id=task_id,
+            request=request,
+        )
+        return StreamingResponse(
+            _task_event_source(
+                user_center=user_center,
+                task_runtime=task_runtime,
+                context=context,
+                task=task,
+                messages=history,
+                user_content=request.message,
+                forced_intent=request.intent,
+                disabled_tools=_disabled_tools_for_request(request),
+                user_metadata={"task_id": task.task_id, "task_mode": True, "task_resume": True},
+                assistant_metadata={"task_id": task.task_id, "task_mode": True, "task_resume": True},
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
 
 def _register_task_stream_route(
@@ -708,7 +788,7 @@ def _register_task_stream_route(
                 messages=history,
                 user_content=request.goal,
                 forced_intent=request.intent,
-                disabled_tools=("search_knowledge_base",) if request.rag_enabled is False else (),
+                disabled_tools=_disabled_tools_for_request(request),
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -844,7 +924,9 @@ def _chat_runtime_config(
         thread_id=thread.thread_id,
     )
     if request.rag_enabled is False:
-        return replace(runtime, rag_mode="off")
+        runtime = replace(runtime, rag_mode="off")
+    if request.web_search_enabled is False:
+        runtime = replace(runtime, enable_web_search=False)
     return runtime
 
 
@@ -1085,6 +1167,8 @@ def _task_event_source(
     user_content: str,
     forced_intent: Literal["chat", "task", "rag_query", "memory_query", "clarify", "unsafe"] | None,
     disabled_tools: Sequence[str],
+    user_metadata: Mapping[str, object] | None = None,
+    assistant_metadata: Mapping[str, object] | None = None,
 ) -> Iterator[str]:
     state = _TaskWorkerState()
 
@@ -1136,8 +1220,8 @@ def _task_event_source(
             user_id=context.user.user_id,
             user_content=user_content,
             assistant_content=final_answer,
-            user_metadata={"task_id": task.task_id, "task_mode": True},
-            assistant_metadata={"task_id": task.task_id, "task_mode": True},
+            user_metadata=dict(user_metadata or {"task_id": task.task_id, "task_mode": True}),
+            assistant_metadata=dict(assistant_metadata or {"task_id": task.task_id, "task_mode": True}),
         )
         payload["message_id"] = assistant_message.message_id
     yield _sse("done", payload)
@@ -1363,15 +1447,25 @@ def _messages_from_update(update: object) -> list[object]:
 
 
 def _tool_status_text(tool_name: str) -> str:
-    if tool_name == "search_knowledge_base":
-        return "Searching knowledge base..."
-    if tool_name == "search_memory":
-        return "Searching memory..."
-    if tool_name == "save_memory":
-        return "Saving memory..."
-    if tool_name == "delete_memory":
-        return "Updating memory..."
-    return f"Using {tool_name}..."
+    status_by_tool = {
+        "search_knowledge_base": "正在检索知识库...",
+        "search_memory": "正在检索长期记忆...",
+        "web_search": "正在联网搜索...",
+        "web_research": "正在阅读网页...",
+        "web_fetch_page": "正在打开网页...",
+        "save_memory": "正在保存记忆...",
+        "delete_memory": "正在更新记忆...",
+    }
+    return status_by_tool.get(tool_name, f"正在调用 {tool_name}...")
+
+
+def _disabled_tools_for_request(request: ChatRequest | TaskCreateRequest | TaskResumeRequest) -> tuple[str, ...]:
+    disabled: list[str] = []
+    if request.rag_enabled is False:
+        disabled.extend(("search_knowledge_base", "rag_agent"))
+    if request.web_search_enabled is False:
+        disabled.extend(("web_search", "web_research", "web_fetch_page", "web_agent"))
+    return tuple(disabled)
 
 
 def _sse(event: str, payload: Mapping[str, object]) -> str:
@@ -1595,6 +1689,77 @@ def _task_or_404(task_runtime: TaskRuntime, *, context: AuthContext, task_id: st
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
     return task
+
+
+def _prepare_task_resume(
+    *,
+    config: AgentRuntimeConfig,
+    user_center: UserCenter,
+    task_runtime: TaskRuntime,
+    context: AuthContext,
+    task_id: str,
+    request: TaskResumeRequest,
+) -> tuple[TaskRecord, list[MessageRecord]]:
+    _raise_if_user_input_too_large(config, request.message)
+    task = _task_or_404(task_runtime, context=context, task_id=task_id)
+    if task.status != "waiting_user":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Task is not waiting for user input.")
+    _require_thread(user_center, context=context, thread_id=task.thread_id)
+    metadata, clarified_goal = _resume_task_metadata_and_goal(task, answer=request.message)
+    resumed = task_runtime.store.update_task(
+        task.task_id,
+        goal=clarified_goal,
+        status="queued",
+        final_answer="",
+        error_message=None,
+        metadata=metadata,
+    )
+    task_runtime.store.add_event(
+        task_id=task.task_id,
+        event_type="hitl_resumed",
+        message="Task resumed with user clarification.",
+        payload={"answer": request.message, "goal": clarified_goal},
+    )
+    history = user_center.list_messages(tenant_id=context.tenant.tenant_id, thread_id=task.thread_id, limit=100)
+    return resumed, history
+
+
+def _resume_task_metadata_and_goal(task: TaskRecord, *, answer: str) -> tuple[dict[str, object], str]:
+    metadata = dict(task.metadata)
+    original_goal = str(metadata.get("original_goal") or task.goal)
+    existing = metadata.get("hitl")
+    hitl = dict(existing) if isinstance(existing, Mapping) else {}
+    question = str(hitl.get("question") or task.final_answer or "")
+    raw_answers = hitl.get("answers")
+    answers = [dict(item) for item in raw_answers if isinstance(item, Mapping)] if isinstance(raw_answers, list) else []
+    answers.append({"question": question, "content": answer, "created_at": datetime.now(tz=UTC).isoformat()})
+    metadata["original_goal"] = original_goal
+    metadata["hitl"] = {
+        **hitl,
+        "status": "resumed",
+        "answers": answers,
+        "last_answer": answer,
+    }
+    return metadata, _clarified_task_goal(original_goal=original_goal, answers=answers)
+
+
+def _clarified_task_goal(*, original_goal: str, answers: Sequence[Mapping[str, object]]) -> str:
+    lines = [
+        "[ORIGINAL TASK]",
+        original_goal.strip(),
+        "",
+        "[USER CLARIFICATIONS]",
+    ]
+    for index, answer in enumerate(answers, start=1):
+        question = str(answer.get("question") or "").strip()
+        content = str(answer.get("content") or "").strip()
+        if question:
+            lines.append(f"{index}. Asked: {question}")
+            lines.append(f"   User answered: {content}")
+        else:
+            lines.append(f"{index}. {content}")
+    lines.extend(("", "Continue the original task using all clarifications above. Treat the clarified task as the current task."))
+    return "\n".join(lines)
 
 
 def _task_payload(result: object) -> dict[str, object]:

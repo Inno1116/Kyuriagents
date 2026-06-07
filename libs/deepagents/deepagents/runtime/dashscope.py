@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -13,7 +13,14 @@ if TYPE_CHECKING:
     from deepagents.runtime.config import AgentRuntimeConfig
 
     class _ChatOpenAIConstructor(Protocol):
-        def __call__(self, *, model: str, api_key: str, base_url: str) -> BaseChatModel:
+        def __call__(
+            self,
+            *,
+            model: str,
+            api_key: str,
+            base_url: str,
+            extra_body: Mapping[str, object] | None = None,
+        ) -> BaseChatModel:
             """Create a chat model."""
             ...
 
@@ -65,10 +72,14 @@ def create_dashscope_model(config: AgentRuntimeConfig, *, model_name: str | None
         msg = "Install `langchain-openai` or `deepagents[runtime]` to use DashScope models."
         raise ImportError(msg) from exc
     model_cls = cast("_ChatOpenAIConstructor", ChatOpenAI)
+    extra_body = None
+    if config.dashscope_enable_thinking is not None:
+        extra_body = {"enable_thinking": config.dashscope_enable_thinking}
     return model_cls(
         model=model_name or config.chat_model,
         api_key=config.dashscope_api_key,
         base_url=config.dashscope_base_url,
+        extra_body=extra_body,
     )
 
 

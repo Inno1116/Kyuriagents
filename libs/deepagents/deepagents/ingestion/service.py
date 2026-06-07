@@ -280,6 +280,7 @@ class KnowledgeBaseService:
         if not parser.supports(request):
             msg = f"Parser `{parser.name}` does not support {request.mime_type or request.filename}."
             raise ValueError(msg)
+        # 解析的真正地方，按页抽取
         parsed = parser.parse(request)
         text = parsed.text.strip()
         if not text:
@@ -427,6 +428,7 @@ def _chunk_windows(text: str, *, size: int, overlap: int) -> list[tuple[str, int
 
 def _chunk_manifest(chunk: DocumentChunk) -> Mapping[str, object]:
     fields = chunk.metadata.to_milvus_fields()
+    fields["chunk_text"] = chunk.text
     fields["tags"] = list(chunk.metadata.tags)
     return fields
 

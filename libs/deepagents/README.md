@@ -17,3 +17,5 @@ npm run dev
 
 还要启动worker
 .\.venv\Scripts\python.exe scripts\ingestion_worker.py
+
+.\.venv\Scripts\python.exe scripts\bootstrap_runtime.py --skip-rag-index --skip-memory-index

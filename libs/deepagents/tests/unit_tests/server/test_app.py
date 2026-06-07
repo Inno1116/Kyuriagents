@@ -17,6 +17,7 @@ from deepagents.server.app import (
     LoginRequest,
     RegisterRequest,
     TaskCreateRequest,
+    TaskResumeRequest,
     TenantCreateRequest,
     UserCreateRequest,
     create_app,
@@ -335,6 +336,30 @@ def test_api_chat_can_disable_rag_per_request():
     assert configs[0].enable_rag is True
 
 
+def test_api_chat_can_disable_web_search_per_request():
+    center = InMemoryUserCenter()
+    agent = FakeAgent()
+    configs: list[AgentRuntimeConfig] = []
+
+    def factory(config: AgentRuntimeConfig, **_kwargs: object) -> FakeAgent:
+        configs.append(config)
+        return agent
+
+    app = _create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key", enable_web_search=True),
+        user_center=center,
+        agent_factory=factory,
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    context = _require_context(center.authenticate_api_key(key.raw_key))
+
+    _endpoint(app, "/v1/chat", "POST")(ChatRequest(message="hello", web_search_enabled=False), context)
+
+    assert configs[0].enable_web_search is False
+
+
 def test_api_task_flow_creates_task_steps_and_messages() -> None:
     center = InMemoryUserCenter()
     runtime = TaskRuntime(store=InMemoryTaskStore())
@@ -359,7 +384,7 @@ def test_api_task_flow_creates_task_steps_and_messages() -> None:
     events = cast("list[dict[str, object]]", response.data["events"])
     assert task["status"] == "succeeded"
     assert task["title"] == "Task test"
-    assert [step["kind"] for step in steps] == ["think", "answer"]
+    assert [step["kind"] for step in steps] == ["process", "answer"]
     assert events[-1]["event_type"] == "finished"
     thread_id = cast("str", task["thread_id"])
     messages = center.list_messages(tenant_id=tenant.tenant_id, thread_id=thread_id)
@@ -399,6 +424,99 @@ def test_api_task_stream_emits_progress_and_persists_messages() -> None:
     assert messages[1].metadata == {"task_id": tasks[0].task_id, "task_mode": True}
 
 
+def test_api_task_resume_continues_waiting_task() -> None:
+    center = InMemoryUserCenter()
+    runtime = TaskRuntime(store=InMemoryTaskStore())
+    app = _create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key"),
+        user_center=center,
+        task_runtime=runtime,
+        agent_factory=lambda _config, **_kwargs: FakeAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    context = _require_context(center.authenticate_api_key(key.raw_key))
+    thread = center.create_thread(tenant_id=tenant.tenant_id, user_id=user.user_id, title="Trip")
+    task = runtime.store.create_task(
+        tenant_id=tenant.tenant_id,
+        user_id=user.user_id,
+        thread_id=thread.thread_id,
+        goal="Plan a trip.",
+        title="Trip",
+        intent="task",
+        metadata={"original_goal": "Plan a trip.", "hitl": {"question": "Where do you want to go?", "answers": []}},
+    )
+    task = runtime.store.update_task(task.task_id, status="waiting_user", final_answer="Where do you want to go?")
+
+    response = _endpoint(app, "/v1/tasks/{task_id}/resume", "POST")(
+        task.task_id,
+        TaskResumeRequest(message="I want to go to Beijing for 7 days."),
+        context,
+    )
+
+    resumed = cast("dict[str, object]", response.data["task"])
+    assert resumed["task_id"] == task.task_id
+    assert resumed["status"] == "succeeded"
+    assert "Beijing" in cast("str", resumed["goal"])
+    assert [stored.task_id for stored in runtime.store.list_tasks(tenant_id=tenant.tenant_id, user_id=user.user_id)] == [task.task_id]
+    metadata = cast("dict[str, object]", resumed["metadata"])
+    hitl = cast("dict[str, object]", metadata["hitl"])
+    answers = cast("list[dict[str, object]]", hitl["answers"])
+    assert metadata["original_goal"] == "Plan a trip."
+    assert hitl["status"] == "resumed"
+    assert answers[-1]["question"] == "Where do you want to go?"
+    assert answers[-1]["content"] == "I want to go to Beijing for 7 days."
+    events = runtime.store.list_events(task_id=task.task_id)
+    assert "hitl_resumed" in [event.event_type for event in events]
+    messages = center.list_messages(tenant_id=tenant.tenant_id, thread_id=thread.thread_id)
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert messages[0].content == "I want to go to Beijing for 7 days."
+    assert messages[0].metadata == {"task_id": task.task_id, "task_mode": True, "task_resume": True}
+    assert messages[1].metadata == {"task_id": task.task_id, "task_mode": True, "task_resume": True}
+
+
+def test_api_task_resume_stream_continues_waiting_task() -> None:
+    center = InMemoryUserCenter()
+    runtime = TaskRuntime(store=InMemoryTaskStore())
+    app = _create_app(
+        config=AgentRuntimeConfig(api_admin_key="admin-key"),
+        user_center=center,
+        task_runtime=runtime,
+        agent_factory=lambda _config, **_kwargs: FakeAgent(),
+    )
+    tenant = center.create_tenant(name="Tenant One", tenant_id="tenant_1")
+    user = center.create_user(tenant_id=tenant.tenant_id, user_id="user_1", email="user@example.test")
+    key = center.create_api_key(tenant_id=tenant.tenant_id, user_id=user.user_id)
+    thread = center.create_thread(tenant_id=tenant.tenant_id, user_id=user.user_id, title="Trip")
+    task = runtime.store.create_task(
+        tenant_id=tenant.tenant_id,
+        user_id=user.user_id,
+        thread_id=thread.thread_id,
+        goal="Plan a trip.",
+        title="Trip",
+        intent="task",
+        metadata={"original_goal": "Plan a trip.", "hitl": {"question": "Where do you want to go?", "answers": []}},
+    )
+    task = runtime.store.update_task(task.task_id, status="waiting_user", final_answer="Where do you want to go?")
+
+    response = TestClient(app).post(
+        f"/v1/tasks/{task.task_id}/resume/stream",
+        headers={"Authorization": f"Bearer {key.raw_key}"},
+        json={"message": "I want to go to Beijing for 7 days."},
+    )
+
+    assert response.status_code == 200
+    assert "event: task_start" in response.text
+    assert "event: done" in response.text
+    assert task.task_id in response.text
+    assert [stored.task_id for stored in runtime.store.list_tasks(tenant_id=tenant.tenant_id, user_id=user.user_id)] == [task.task_id]
+    messages = center.list_messages(tenant_id=tenant.tenant_id, thread_id=thread.thread_id)
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert messages[0].metadata == {"task_id": task.task_id, "task_mode": True, "task_resume": True}
+    assert messages[1].metadata == {"task_id": task.task_id, "task_mode": True, "task_resume": True}
+
+
 def test_api_chat_stream_emits_status_delta_and_persists_message():
     center = InMemoryUserCenter()
     agent = FakeAgent(
@@ -427,7 +545,7 @@ def test_api_chat_stream_emits_status_delta_and_persists_message():
 
     assert response.status_code == 200
     assert "event: message_start" in response.text
-    assert "Searching knowledge base" in response.text
+    assert "正在检索知识库" in response.text
     assert "I will search first" not in response.text
     assert 'data: {"text":"po"}' in response.text
     assert 'data: {"text":"ng"}' in response.text
@@ -602,6 +720,8 @@ def test_auth_context_is_not_exposed_as_query_parameter():
         ("/v1/tasks", "GET"),
         ("/v1/tasks", "POST"),
         ("/v1/tasks/stream", "POST"),
+        ("/v1/tasks/{task_id}/resume", "POST"),
+        ("/v1/tasks/{task_id}/resume/stream", "POST"),
         ("/v1/tasks/{task_id}", "GET"),
         ("/v1/tasks/{task_id}/events", "GET"),
         ("/v1/tasks/{task_id}/cancel", "POST"),

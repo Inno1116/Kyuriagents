@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 TaskIntent = Literal["chat", "task", "rag_query", "memory_query", "clarify", "unsafe"]
 TaskStatus = Literal["queued", "planning", "running", "waiting_user", "succeeded", "failed", "cancelled"]
-TaskStepKind = Literal["think", "tool", "answer"]
+TaskStepKind = Literal["think", "tool", "rag", "web", "process", "answer"]
 TaskStepStatus = Literal["pending", "running", "succeeded", "failed", "skipped", "cancelled"]
 TaskEventType = Literal[
     "created",
@@ -18,6 +18,8 @@ TaskEventType = Literal[
     "context",
     "planned",
     "validated",
+    "hitl_requested",
+    "hitl_resumed",
     "step_started",
     "step_finished",
     "retry",

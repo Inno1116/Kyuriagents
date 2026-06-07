@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 from deepagents.rag import (
+    DashScopeTextReranker,
     ElasticsearchKeywordStore,
     HybridRAGRetriever,
     MilvusVectorStore,
+    PostgresChunkTextHydrator,
     evaluate_stratrag_retriever,
     load_stratrag_jsonl,
     stratrag_chunks,
@@ -212,6 +214,7 @@ def ingest_stratrag(
         embeddings = embed_documents([chunk.text for chunk in batch])
         _bulk_index_elasticsearch(es, config.rag_es_index, batch)
         _upsert_milvus(milvus, config.rag_milvus_collection, batch, embeddings)
+        _upsert_postgres_chunks(config, batch)
         indexed += len(batch)
         _LOGGER.info("indexed chunks=%s/%s", indexed, len(chunks))
 
@@ -255,6 +258,15 @@ def evaluate_stratrag(
             index=config.rag_es_index,
             url=config.rag_es_url,
         ),
+        chunk_hydrator=PostgresChunkTextHydrator(dsn=config.postgres_dsn) if config.postgres_dsn else None,
+        reranker=DashScopeTextReranker(
+            api_key=config.dashscope_api_key or "",
+            model=config.rag_rerank_model,
+            endpoint=config.rag_rerank_url,
+            timeout_seconds=config.rag_rerank_timeout_seconds,
+        )
+        if config.rag_rerank_model
+        else None,
     )
     result = evaluate_stratrag_retriever(
         examples,
@@ -388,6 +400,129 @@ def _upsert_milvus(
         row["embedding"] = [float(value) for value in embedding]
         rows.append(row)
     milvus.upsert(collection_name=collection_name, data=rows)
+
+
+def _upsert_postgres_chunks(config: AgentRuntimeConfig, chunks: Sequence[DocumentChunk]) -> None:
+    if not config.postgres_dsn:
+        return
+    try:
+        import psycopg  # noqa: PLC0415
+        from psycopg.types.json import Jsonb  # noqa: PLC0415
+    except ImportError as exc:
+        msg = "Install `deepagents[runtime]` or `psycopg` to write StratRAG chunk text into PostgreSQL."
+        raise ImportError(msg) from exc
+
+    with psycopg.connect(config.postgres_dsn) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO rag_tenants (tenant_id, name)
+            VALUES (%(tenant_id)s, %(name)s)
+            ON CONFLICT (tenant_id) DO UPDATE SET name = EXCLUDED.name
+            """,
+            {"tenant_id": config.tenant_id, "name": "StratRAG evaluation"},
+        )
+        for chunk in chunks:
+            metadata = chunk.metadata
+            cursor.execute(
+                """
+                INSERT INTO rag_knowledge_bases (kb_id, tenant_id, name, visibility, status, metadata)
+                VALUES (%(kb_id)s, %(tenant_id)s, %(name)s, 'public', 'active', %(metadata)s)
+                ON CONFLICT (kb_id) DO UPDATE
+                SET name = EXCLUDED.name,
+                    visibility = EXCLUDED.visibility,
+                    status = EXCLUDED.status,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = now()
+                """,
+                {
+                    "kb_id": metadata.kb_id,
+                    "tenant_id": metadata.tenant_id,
+                    "name": metadata.kb_id,
+                    "metadata": Jsonb({"source": "stratrag"}),
+                },
+            )
+            cursor.execute(
+                """
+                INSERT INTO rag_documents (
+                    doc_id, tenant_id, kb_id, source_type, source_uri, file_name,
+                    title, language, visibility, status, latest_version, metadata
+                )
+                VALUES (
+                    %(doc_id)s, %(tenant_id)s, %(kb_id)s, %(source_type)s, %(source_uri)s, %(file_name)s,
+                    %(title)s, %(language)s, %(visibility)s, 'active', %(doc_version)s, %(metadata)s
+                )
+                ON CONFLICT (doc_id) DO UPDATE
+                SET title = EXCLUDED.title,
+                    language = EXCLUDED.language,
+                    visibility = EXCLUDED.visibility,
+                    status = EXCLUDED.status,
+                    latest_version = EXCLUDED.latest_version,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = now()
+                """,
+                {
+                    "doc_id": metadata.doc_id,
+                    "tenant_id": metadata.tenant_id,
+                    "kb_id": metadata.kb_id,
+                    "source_type": metadata.source_type,
+                    "source_uri": metadata.source_uri,
+                    "file_name": metadata.doc_id,
+                    "title": metadata.title,
+                    "language": metadata.language,
+                    "visibility": metadata.visibility,
+                    "doc_version": metadata.doc_version,
+                    "metadata": Jsonb({"source": "stratrag"}),
+                },
+            )
+            cursor.execute(
+                """
+                INSERT INTO rag_document_versions (
+                    doc_version, doc_id, tenant_id, content_hash, parser_version,
+                    chunker_version, embedding_model, embedding_version, chunk_count, status, indexed_at
+                )
+                VALUES (
+                    %(doc_version)s, %(doc_id)s, %(tenant_id)s, %(content_hash)s, 'stratrag:v1',
+                    'stratrag-doc-pool:v1', %(embedding_model)s, %(embedding_version)s, 1, 'indexed', now()
+                )
+                ON CONFLICT (doc_id, content_hash, embedding_model, embedding_version) DO UPDATE
+                SET status = 'indexed',
+                    chunk_count = EXCLUDED.chunk_count,
+                    indexed_at = now()
+                """,
+                {
+                    "doc_version": metadata.doc_version,
+                    "doc_id": metadata.doc_id,
+                    "tenant_id": metadata.tenant_id,
+                    "content_hash": metadata.content_hash,
+                    "embedding_model": metadata.embedding_model,
+                    "embedding_version": metadata.embedding_version,
+                },
+            )
+            values = metadata.to_milvus_fields()
+            values["chunk_text"] = chunk.text
+            values["tags"] = Jsonb(list(metadata.tags))
+            cursor.execute(
+                """
+                INSERT INTO rag_chunks (
+                    chunk_id, tenant_id, kb_id, doc_id, doc_version, user_id, chunk_index,
+                    content_hash, chunk_text, source_type, source_uri, title, section_path, page_start,
+                    page_end, char_start, char_end, language, tags, visibility,
+                    embedding_model, embedding_version, schema_version, is_active
+                )
+                VALUES (
+                    %(chunk_id)s, %(tenant_id)s, %(kb_id)s, %(doc_id)s, %(doc_version)s, %(user_id)s, %(chunk_index)s,
+                    %(content_hash)s, %(chunk_text)s, %(source_type)s, %(source_uri)s, %(title)s, %(section_path)s, %(page_start)s,
+                    %(page_end)s, %(char_start)s, %(char_end)s, %(language)s, %(tags)s, %(visibility)s,
+                    %(embedding_model)s, %(embedding_version)s, %(schema_version)s, %(is_active)s
+                )
+                ON CONFLICT (chunk_id) DO UPDATE
+                SET chunk_text = EXCLUDED.chunk_text,
+                    tags = EXCLUDED.tags,
+                    is_active = EXCLUDED.is_active,
+                    updated_at = now()
+                """,
+                values,
+            )
 
 
 def _create_embed_documents(config: AgentRuntimeConfig, *, embedding_batch_size: int) -> EmbedDocuments:

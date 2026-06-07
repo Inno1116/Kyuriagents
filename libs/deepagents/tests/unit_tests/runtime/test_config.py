@@ -13,8 +13,11 @@ def test_runtime_config_from_env_parses_services_and_modes() -> None:
             "DEEPAGENTS_THREAD_ID": "thread-1",
             "DASHSCOPE_API_KEY": "key",
             "DASHSCOPE_CHAT_MODEL": "qwen-plus",
+            "DASHSCOPE_ENABLE_THINKING": "false",
             "DASHSCOPE_EMBEDDING_MODEL": "text-embedding-v3",
             "DASHSCOPE_EMBEDDING_DIMENSIONS": "1024",
+            "DEEPAGENTS_RAG_RERANK_MODEL": "qwen3-vl-rerank",
+            "DEEPAGENTS_RAG_RERANK_TIMEOUT_SECONDS": "12",
             "DEEPAGENTS_POSTGRES_DSN": "postgresql://app",
             "DEEPAGENTS_RAG_MODE": "hybrid",
             "DEEPAGENTS_MEMORY_MODE": "auto",
@@ -41,6 +44,16 @@ def test_runtime_config_from_env_parses_services_and_modes() -> None:
             "DEEPAGENTS_ENABLE_INGESTION_REDIS_QUEUE": "true",
             "DEEPAGENTS_INGESTION_REDIS_QUEUE_NAME": "kyuri:test:ingestion",
             "DEEPAGENTS_INGESTION_REDIS_BLOCK_TIMEOUT_SECONDS": "5",
+            "DEEPAGENTS_ENABLE_SUBAGENTS": "true",
+            "DEEPAGENTS_ENABLE_TASK_GRAPH_RUNTIME": "false",
+            "DEEPAGENTS_ENABLE_WEB_SEARCH": "true",
+            "SEARXNG_BASE_URL": "http://searxng:8080",
+            "DEEPAGENTS_WEB_SEARCH_QUERY_PLAN_SIZE": "4",
+            "DEEPAGENTS_WEB_SEARCH_CACHE_TTL_SECONDS": "120",
+            "DEEPAGENTS_WEB_SEARCH_RERANK_CANDIDATES": "16",
+            "DEEPAGENTS_WEB_AGENT_MAX_SEARCH_CALLS": "4",
+            "DEEPAGENTS_WEB_SEARCH_FALLBACK_ENGINES": "bing,baidu",
+            "DEEPAGENTS_WEB_FETCH_CONCURRENCY": "4",
         }
     )
 
@@ -48,7 +61,10 @@ def test_runtime_config_from_env_parses_services_and_modes() -> None:
     assert config.user_id == "user-1"
     assert config.thread_id == "thread-1"
     assert config.dashscope_api_key == "key"
+    assert config.dashscope_enable_thinking is False
     assert config.embedding_dimensions == 1024
+    assert config.rag_rerank_model == "qwen3-vl-rerank"
+    assert config.rag_rerank_timeout_seconds == 12.0
     assert config.postgres_dsn == "postgresql://app"
     assert config.rag_mode == "hybrid"
     assert config.memory_mode == "auto"
@@ -74,6 +90,16 @@ def test_runtime_config_from_env_parses_services_and_modes() -> None:
     assert config.enable_ingestion_redis_queue
     assert config.ingestion_redis_queue_name == "kyuri:test:ingestion"
     assert config.ingestion_redis_block_timeout_seconds == 5
+    assert config.enable_subagents
+    assert config.enable_task_graph_runtime is False
+    assert config.enable_web_search
+    assert config.searxng_base_url == "http://searxng:8080"
+    assert config.web_search_query_plan_size == 4
+    assert config.web_search_cache_ttl_seconds == 120
+    assert config.web_search_rerank_candidates == 16
+    assert config.web_agent_max_search_calls == 4
+    assert config.web_search_fallback_engines == ("bing", "baidu")
+    assert config.web_fetch_concurrency == 4
 
 
 def test_runtime_config_rejects_invalid_modes() -> None:
@@ -91,3 +117,9 @@ def test_runtime_config_reports_missing_runtime_secrets() -> None:
 
     assert config.missing_for_model() == ("DASHSCOPE_API_KEY",)
     assert config.missing_for_memory() == ("DEEPAGENTS_POSTGRES_DSN",)
+
+
+def test_runtime_config_allows_disabling_rag_rerank() -> None:
+    config = AgentRuntimeConfig.from_env(env={"DEEPAGENTS_RAG_RERANK_MODEL": "off"})
+
+    assert config.rag_rerank_model is None

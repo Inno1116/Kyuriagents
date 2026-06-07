@@ -2,9 +2,9 @@
 
 This package contains the online retrieval path for a hybrid RAG system:
 query rewriting, keyword/vector retrieval, rank fusion, reranking, and Top-K
-selection. Offline document parsing and embedding jobs should write chunks into
-Milvus, Elasticsearch, and the PostgreSQL metadata tables described in
-`deepagents/rag/schemas`.
+selection. Offline document parsing and embedding jobs should write canonical
+chunk text into PostgreSQL, searchable copies into Elasticsearch, and vector
+metadata into Milvus.
 """
 
 from deepagents.rag.elasticsearch import ElasticsearchKeywordStore
@@ -12,8 +12,9 @@ from deepagents.rag.hybrid import HybridRAGRetriever, HybridSearchConfig
 from deepagents.rag.in_memory import InMemoryKeywordStore, InMemoryVectorStore
 from deepagents.rag.metadata import ChunkMetadata, RetrievalScope
 from deepagents.rag.milvus import MilvusVectorStore
+from deepagents.rag.postgres import PostgresChunkTextHydrator
 from deepagents.rag.query import IdentityQueryRewriter, QueryRewrite, QueryRewriter
-from deepagents.rag.rerank import FusedScoreReranker, LexicalReranker
+from deepagents.rag.rerank import DashScopeTextReranker, FusedScoreReranker, LexicalReranker
 from deepagents.rag.stratrag import (
     StratRAGAggregateResult,
     StratRAGDocument,
@@ -33,6 +34,7 @@ from deepagents.rag.stratrag import (
     stratrag_chunks,
 )
 from deepagents.rag.types import (
+    ChunkHydrator,
     DocumentChunk,
     KeywordSearcher,
     Reranker,
@@ -41,7 +43,9 @@ from deepagents.rag.types import (
 )
 
 __all__ = [
+    "ChunkHydrator",
     "ChunkMetadata",
+    "DashScopeTextReranker",
     "DocumentChunk",
     "ElasticsearchKeywordStore",
     "FusedScoreReranker",
@@ -53,6 +57,7 @@ __all__ = [
     "KeywordSearcher",
     "LexicalReranker",
     "MilvusVectorStore",
+    "PostgresChunkTextHydrator",
     "QueryRewrite",
     "QueryRewriter",
     "Reranker",

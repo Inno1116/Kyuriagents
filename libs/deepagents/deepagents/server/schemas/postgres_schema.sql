@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS agent_task_steps (
     step_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES agent_tasks(task_id) ON DELETE CASCADE,
     step_index INTEGER NOT NULL CHECK (step_index >= 0),
-    kind TEXT NOT NULL CHECK (kind IN ('think', 'tool', 'answer')),
+    kind TEXT NOT NULL CHECK (kind IN ('think', 'tool', 'rag', 'web', 'process', 'answer')),
     title TEXT NOT NULL DEFAULT '',
     instruction TEXT NOT NULL DEFAULT '',
     tool_name TEXT NOT NULL DEFAULT '',
@@ -147,6 +147,12 @@ CREATE TABLE IF NOT EXISTS agent_task_steps (
     finished_at TIMESTAMPTZ,
     UNIQUE (task_id, step_index)
 );
+
+ALTER TABLE IF EXISTS agent_task_steps
+    DROP CONSTRAINT IF EXISTS agent_task_steps_kind_check;
+ALTER TABLE IF EXISTS agent_task_steps
+    ADD CONSTRAINT agent_task_steps_kind_check
+        CHECK (kind IN ('think', 'tool', 'rag', 'web', 'process', 'answer'));
 
 CREATE INDEX IF NOT EXISTS agent_task_steps_task_idx
     ON agent_task_steps(task_id, step_index);

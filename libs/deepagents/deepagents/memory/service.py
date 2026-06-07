@@ -37,7 +37,10 @@ def format_memory_context(
     lines = ["<agent_long_term_memory>"]
     for result in compressed.results:
         memory = result.memory
-        text = memory.summary or memory.content
+        if memory.summary and memory.summary.strip() != memory.content.strip():
+            text = f"{memory.summary}: {memory.content}"
+        else:
+            text = memory.content or memory.summary
         lines.append(
             f"- [{memory.memory_type}; scope={memory.scope_type}/{memory.scope_id}; "
             f"confidence={memory.confidence:.2f}; importance={memory.importance:.2f}] {text}"

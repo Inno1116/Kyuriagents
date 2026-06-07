@@ -205,6 +205,39 @@ def test_fusion_prefers_keyword_text_when_vector_hit_is_metadata_only() -> None:
     assert results[0].keyword_score == 3.0
 
 
+def test_hybrid_retrieval_hydrates_vector_only_text_before_rerank() -> None:
+    metadata = _metadata("auth-1")
+
+    class VectorOnly:
+        def search(self, query, *, scope, limit):
+            return [
+                RetrievedChunk(
+                    text="",
+                    metadata=metadata,
+                    vector_score=0.9,
+                )
+            ]
+
+    class NoKeywords:
+        def search(self, query, *, scope, limit):
+            return []
+
+    class Hydrator:
+        def hydrate(self, candidates):
+            return [candidate.with_text("Authentication setup text from PostgreSQL") for candidate in candidates]
+
+    retriever = HybridRAGRetriever(
+        vector_searcher=VectorOnly(),
+        keyword_searcher=NoKeywords(),
+        chunk_hydrator=Hydrator(),
+    )
+
+    results = retriever.retrieve("auth", scope=RetrievalScope(tenant_id="tenant-a"))
+
+    assert results[0].text == "Authentication setup text from PostgreSQL"
+    assert results[0].rerank_score is not None
+
+
 def test_invalid_hybrid_config_rejected() -> None:
     with pytest.raises(ValueError, match="top_k"):
         HybridSearchConfig(top_k=0)

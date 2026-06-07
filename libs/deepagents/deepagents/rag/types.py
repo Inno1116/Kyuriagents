@@ -80,6 +80,32 @@ class RetrievedChunk:
             rerank_score=self.rerank_score if rerank_score is None else rerank_score,
         )
 
+    def with_text(self, text: str) -> RetrievedChunk:
+        """Return a copy with replacement text.
+
+        Args:
+            text: Hydrated chunk text.
+
+        Returns:
+            New `RetrievedChunk` instance.
+        """
+        return replace(self, text=text)
+
+
+class ChunkHydrator(Protocol):
+    """Protocol implemented by stores that hydrate chunk text by id."""
+
+    def hydrate(self, candidates: Sequence[RetrievedChunk]) -> list[RetrievedChunk]:
+        """Hydrate missing chunk text.
+
+        Args:
+            candidates: Fused retrieval candidates.
+
+        Returns:
+            Candidates with text filled when available.
+        """
+        ...
+
 
 class VectorSearcher(Protocol):
     """Protocol implemented by semantic vector stores such as Milvus."""

@@ -9,12 +9,21 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, cast
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from deepagents.middleware.retrieval import RuntimeContextDefaults, format_rag_context
-from deepagents.rag import ElasticsearchKeywordStore, HybridRAGRetriever, MilvusVectorStore, RetrievalScope
+from deepagents.rag import (
+    DashScopeTextReranker,
+    ElasticsearchKeywordStore,
+    HybridRAGRetriever,
+    MilvusVectorStore,
+    PostgresChunkTextHydrator,
+    RetrievalScope,
+)
+from deepagents.tasks.evidence import EvidenceAgent, EvidenceRequest, create_evidence_agents, format_evidence_package
 from deepagents.tasks.store import InMemoryTaskStore, PostgresTaskStore, TaskStore, new_step_record
 from deepagents.tasks.types import (
     PlannedStep,
@@ -28,14 +37,16 @@ from deepagents.tasks.types import (
     TaskStepRecord,
     ValidationResult,
 )
-from deepagents.tools import ToolDescriptor, ToolRegistry, default_tool_registry
+from deepagents.tools import ToolCallRecord, ToolCallStatus, ToolDescriptor, ToolRegistry, ToolRisk, default_tool_registry
 
 if TYPE_CHECKING:
     from deepagents.runtime import AgentRuntimeConfig
     from deepagents.server.identity import MessageRecord
+    from deepagents.tools.audit import ToolAuditSink
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_STEPS = 8
+_AUDIT_SUMMARY_LIMIT = 2_000
 _TOOL_THREAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="deepagents-task-tool")
 _TASK_HINT_RE = re.compile(
     "(?i)(help me|research|analyze|summarize|compare|draft|create|plan|investigate|"
@@ -45,6 +56,10 @@ _RAG_HINT_RE = re.compile(
     "(?i)(knowledge base|document|pdf|paper|file|\\u8d44\\u6599|\\u77e5\\u8bc6\\u5e93|\\u6587\\u6863|\\u8bba\\u6587|\\u6587\\u4ef6|\\u6839\\u636e)"
 )
 _MEMORY_HINT_RE = re.compile("(?i)(memory|remember|preference|my name|\\u8bb0\\u5fc6|\\u8bb0\\u4f4f|\\u504f\\u597d|\\u6211\\u7684\\u540d\\u5b57)")
+_WEB_HINT_RE = re.compile(
+    "(?i)(web|online|internet|current|latest|news|search|website|url|"
+    "\\u8054\\u7f51|\\u7f51\\u9875|\\u7f51\\u4e0a|\\u641c\\u7d22|\\u6700\\u65b0|\\u4eca\\u5929|\\u65b0\\u95fb|\\u7f51\\u5740|\\u94fe\\u63a5)"
+)
 
 
 class _Model(Protocol):
@@ -66,7 +81,7 @@ class TaskRuntimeLimits:
     max_total_steps: int = 12
     max_tool_calls: int = 8
     max_step_retries: int = 1
-    max_runtime_seconds: float = 180.0
+    max_runtime_seconds: float = 600.0
     max_same_error: int = 2
     max_step_output_chars: int = 4_000
     tool_timeout_seconds: float = 45.0
@@ -228,14 +243,19 @@ class LLMPlanner:
         model = self._model_factory()
         prompt = (
             "You are the planner for Kyuriagents task mode. Return only JSON.\n"
-            "Allowed step kinds: think, tool, answer.\n"
-            "Only use tool names from available_tools. Prefer read-only tools before answering.\n"
+            "The `goal` field is the current user task and is authoritative.\n"
+            "Use `recent_messages` only as background about prior user requests or preferences.\n"
+            "Never continue, repeat, or optimize a previous task unless the current `goal` explicitly asks for it.\n"
+            "Allowed step kinds: rag, web, process, think, tool, answer.\n"
+            "`rag` searches uploaded/private knowledge-base documents. `web` researches current public web sources.\n"
+            "`process` analyzes prior step outputs without fetching new data. `tool` is only for explicit direct tools.\n"
+            "Only use direct tool names from available_tools when kind is `tool`. Prefer rag/web/process before answering.\n"
             "Keep plans short and executable. Do not invent tools.\n"
             "Always include one final answer step as the last step.\n\n"
             f"Context:\n{json.dumps(_context_payload(context), ensure_ascii=False)}\n\n"
             "Return schema:\n"
             '{"goal": string, "summary": string, "steps": ['
-            '{"kind": "think|tool|answer", "title": string, "instruction": string, '
+            '{"kind": "rag|web|process|think|tool|answer", "title": string, "instruction": string, '
             '"tool_name": string, "input": object, "depends_on": [string], "parallel_group": string}'
             "]}"
         )
@@ -251,7 +271,17 @@ def heuristic_plan(context: TaskContext) -> TaskPlan:
     """Build a conservative fallback plan from intent and tool availability."""
     tools = {str(tool.get("name")) for tool in context.available_tools}
     steps: list[PlannedStep] = []
-    if context.intent in {"task", "rag_query"} and "search_knowledge_base" in tools:
+    if context.intent in {"task", "rag_query"} and "rag_agent" in tools:
+        steps.append(
+            PlannedStep(
+                kind="rag",
+                title="Search knowledge-base evidence",
+                instruction="Search uploaded and indexed knowledge-base documents, then return a structured evidence package.",
+                input={"query": context.goal, "top_k": 6},
+                parallel_group="context_lookup",
+            )
+        )
+    elif context.intent in {"task", "rag_query"} and "search_knowledge_base" in tools:
         steps.append(
             PlannedStep(
                 kind="tool",
@@ -273,10 +303,31 @@ def heuristic_plan(context: TaskContext) -> TaskPlan:
                 parallel_group="context_lookup",
             )
         )
+    if context.intent == "task" and "web_agent" in tools and _WEB_HINT_RE.search(context.goal):
+        steps.append(
+            PlannedStep(
+                kind="web",
+                title="Research public web evidence",
+                instruction="Search current public web sources and return a structured evidence package with citations.",
+                input={"query": context.goal, "max_results": 8, "max_pages": 3},
+                parallel_group="context_lookup",
+            )
+        )
+    elif context.intent == "task" and "web_research" in tools and _WEB_HINT_RE.search(context.goal):
+        steps.append(
+            PlannedStep(
+                kind="tool",
+                title="Research public web",
+                instruction="Search the public web and read relevant pages with sourced excerpts.",
+                tool_name="web_research",
+                input={"query": context.goal, "max_results": 8, "max_pages": 4},
+                parallel_group="context_lookup",
+            )
+        )
     if context.intent == "task":
         steps.append(
             PlannedStep(
-                kind="think",
+                kind="process",
                 title="Organize gathered information",
                 instruction="Organize tool results and identify which facts support the final answer.",
             )
@@ -316,8 +367,16 @@ class PlanValidator:
 def _validate_planned_step(step: PlannedStep, *, index: int, available: Mapping[str, Mapping[str, object]]) -> list[str]:
     errors: list[str] = []
     label = f"Step {index + 1}"
-    if step.kind not in {"think", "tool", "answer"}:
+    if step.kind not in {"think", "tool", "rag", "web", "process", "answer"}:
         errors.append(f"{label} has unsupported kind `{step.kind}`.")
+        return errors
+    if step.kind == "rag":
+        if "rag_agent" not in available:
+            errors.append(f"{label} requires unavailable evidence agent `rag_agent`.")
+        return errors
+    if step.kind == "web":
+        if "web_agent" not in available:
+            errors.append(f"{label} requires unavailable evidence agent `web_agent`.")
         return errors
     if step.kind != "tool":
         return errors
@@ -339,11 +398,14 @@ class TaskToolExecutor:
         handlers: Mapping[str, ToolHandler],
         descriptors: Sequence[ToolDescriptor],
         timeout_seconds: float = 45.0,
+        audit_sink: ToolAuditSink | None = None,
     ) -> None:
         """Initialize the executor."""
         self._handlers = dict(handlers)
         self.descriptors = tuple(descriptors)
+        self._descriptors = {descriptor.name: descriptor for descriptor in self.descriptors}
         self._timeout_seconds = timeout_seconds
+        self._audit_sink = audit_sink
 
     @classmethod
     def from_config(cls, config: AgentRuntimeConfig) -> TaskToolExecutor:
@@ -356,7 +418,20 @@ class TaskToolExecutor:
         if config.enable_memory and config.postgres_dsn:
             handlers["search_memory"] = _memory_handler(config)
             descriptors.append(default_tool_registry().descriptor_for("search_memory"))
-        return cls(handlers=handlers, descriptors=descriptors)
+        if config.enable_web_search:
+            from deepagents.websearch import web_search_tool_descriptors  # noqa: PLC0415
+
+            handlers["web_search"] = _web_search_handler(config)
+            handlers["web_research"] = _web_research_handler(config)
+            handlers["web_fetch_page"] = _web_fetch_page_handler(config)
+            web_descriptors = web_search_tool_descriptors(timeout_seconds=max(1, int(config.web_render_timeout_seconds)))
+            descriptors.extend(descriptor for descriptor in web_descriptors if descriptor.name in handlers)
+        audit_sink = None
+        if config.enable_tool_audit and config.postgres_dsn:
+            from deepagents.tools import PostgresToolAuditSink  # noqa: PLC0415
+
+            audit_sink = PostgresToolAuditSink(dsn=config.postgres_dsn)
+        return cls(handlers=handlers, descriptors=descriptors, audit_sink=audit_sink)
 
     def execute(self, step: TaskStepRecord, context: TaskExecutionContext) -> str:
         """Execute one tool step."""
@@ -364,38 +439,104 @@ class TaskToolExecutor:
         if handler is None:
             msg = f"Task tool `{step.tool_name}` is not available."
             raise ValueError(msg)
+        descriptor = self._descriptors.get(step.tool_name)
+        started = time.perf_counter()
         future: Future[str] = _TOOL_THREAD_POOL.submit(handler, context, step.input)
         try:
-            return future.result(timeout=self._timeout_seconds)
+            output = future.result(timeout=self._timeout_seconds)
         except FutureTimeoutError as exc:
             future.cancel()
             msg = f"Task tool `{step.tool_name}` timed out after {self._timeout_seconds:.1f}s."
+            self._record_audit(step, context=context, descriptor=descriptor, status="error", started=started, error=msg)
             raise TimeoutError(msg) from exc
+        except Exception as exc:
+            self._record_audit(step, context=context, descriptor=descriptor, status="error", started=started, error=str(exc))
+            raise
+        self._record_audit(step, context=context, descriptor=descriptor, status="success", started=started, output=output)
+        return output
+
+    def _record_audit(
+        self,
+        step: TaskStepRecord,
+        *,
+        context: TaskExecutionContext,
+        descriptor: ToolDescriptor | None,
+        status: ToolCallStatus,
+        started: float,
+        output: object = None,
+        error: str | None = None,
+    ) -> None:
+        if self._audit_sink is None or descriptor is None:
+            return
+        record = ToolCallRecord(
+            call_id=step.step_id,
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            thread_id=context.thread_id,
+            tool_name=descriptor.name,
+            source=descriptor.source,
+            risk=descriptor.risk,
+            status=status,
+            input_summary=_json_summary(step.input),
+            output_summary=_json_summary(output),
+            duration_ms=max(0, int((time.perf_counter() - started) * 1000)),
+            error=error,
+            created_at=datetime.now(tz=UTC).isoformat(),
+            metadata={"task_mode": True, "step_id": step.step_id, "requires_confirmation": descriptor.requires_confirmation, **descriptor.metadata},
+        )
+        try:
+            self._audit_sink.record(record)
+        except Exception as exc:  # noqa: BLE001  # Audit failures should not break task execution.
+            _LOGGER.warning("Task tool audit failed: %s", exc)
 
 
 class TaskStepExecutor:
-    """Execute think, tool, and answer steps."""
+    """Execute information, reasoning, direct-tool, and answer steps."""
 
-    def __init__(self, *, model_factory: ModelFactory | None, tool_executor: TaskToolExecutor) -> None:
+    def __init__(
+        self,
+        *,
+        model_factory: ModelFactory | None,
+        tool_executor: TaskToolExecutor,
+        evidence_agents: Mapping[str, EvidenceAgent] | None = None,
+    ) -> None:
         """Initialize the executor."""
         self._model_factory = model_factory
         self._tool_executor = tool_executor
+        self._evidence_agents = dict(evidence_agents or {})
 
     @property
     def tool_descriptors(self) -> tuple[ToolDescriptor, ...]:
         """Return tool descriptors visible to the planner."""
-        return self._tool_executor.descriptors
+        descriptors = list(self._tool_executor.descriptors)
+        if "rag" in self._evidence_agents:
+            descriptors = [descriptor for descriptor in descriptors if descriptor.name != "search_knowledge_base"]
+        if "web" in self._evidence_agents:
+            descriptors = [
+                descriptor
+                for descriptor in descriptors
+                if descriptor.name not in {"web_search", "web_research", "web_fetch_page", "web_fetch_static", "web_render_page"}
+            ]
+        descriptors.extend(agent.descriptor for agent in self._evidence_agents.values())
+        return tuple(descriptors)
 
     def execute(self, step: TaskStepRecord, *, context: TaskExecutionContext, previous_steps: Sequence[TaskStepRecord]) -> str:
         """Execute one step."""
+        if step.kind in {"rag", "web"}:
+            return self._evidence_step(step, context=context)
         if step.kind == "tool":
             return self._tool_executor.execute(step, context)
-        if step.kind == "think":
+        if step.kind in {"think", "process"}:
+            purpose = (
+                "Analyze gathered evidence, resolve conflicts, and produce concise structured conclusions."
+                if step.kind == "process"
+                else "Organize intermediate results into concise points."
+            )
             return self._model_step(
                 step,
                 context=context,
                 previous_steps=previous_steps,
-                purpose="Organize intermediate results into concise points.",
+                purpose=purpose,
             )
         if step.kind == "answer":
             return self._model_step(
@@ -406,6 +547,24 @@ class TaskStepExecutor:
             )
         msg = f"Unsupported task step kind `{step.kind}`."
         raise ValueError(msg)
+
+    def _evidence_step(self, step: TaskStepRecord, *, context: TaskExecutionContext) -> str:
+        agent = self._evidence_agents.get(step.kind)
+        if agent is None:
+            msg = f"Evidence agent for `{step.kind}` steps is not available."
+            raise ValueError(msg)
+        query = str(step.input.get("query") or step.instruction or context.goal)
+        package = agent.run(
+            EvidenceRequest(
+                query=query,
+                tenant_id=context.tenant_id,
+                user_id=context.user_id,
+                thread_id=context.thread_id,
+                goal=context.goal,
+                input=step.input,
+            )
+        )
+        return format_evidence_package(package)
 
     def _model_step(
         self,
@@ -451,7 +610,7 @@ class Observer:
                 return StepObservation(decision="retry", message=str(error))
             if step.kind == "tool" and can_replan and not same_error_exceeded:
                 return StepObservation(decision="replan", message=str(error))
-            if step.kind == "tool" and _can_skip_failed_tool(step):
+            if _is_external_step(step) and _can_skip_failed_tool(step):
                 return StepObservation(decision="skip", message=str(error))
             return StepObservation(decision="fail", message=str(error))
         if step.kind == "answer":
@@ -490,6 +649,10 @@ class TaskRuntime:
     @classmethod
     def from_config(cls, config: AgentRuntimeConfig) -> TaskRuntime:
         """Create the default runtime for deployed API servers."""
+        if config.enable_task_graph_runtime:
+            from deepagents.tasks.graph_runtime import GraphTaskRuntime  # noqa: PLC0415
+
+            return GraphTaskRuntime.from_config(config)
 
         def model_factory() -> _Model:
             from deepagents.runtime.dashscope import create_dashscope_model  # noqa: PLC0415
@@ -499,10 +662,11 @@ class TaskRuntime:
         store: TaskStore = PostgresTaskStore(dsn=config.postgres_dsn) if config.postgres_dsn else InMemoryTaskStore()
         limits = TaskRuntimeLimits()
         tool_executor = TaskToolExecutor.from_config(config)
+        evidence_agents = create_evidence_agents(config)
         return cls(
             store=store,
             planner=LLMPlanner(model_factory=model_factory),
-            executor=TaskStepExecutor(model_factory=model_factory, tool_executor=tool_executor),
+            executor=TaskStepExecutor(model_factory=model_factory, tool_executor=tool_executor, evidence_agents=evidence_agents),
             context_builder=ContextBuilder(),
             limits=limits,
         )
@@ -611,7 +775,7 @@ class TaskRuntime:
         while index < len(queue):
             self._check_runtime_budget(state)
             step = queue[index]
-            if step.kind == "tool" and state.tool_calls >= self._limits.max_tool_calls:
+            if _counts_toward_tool_limit(step) and state.tool_calls >= self._limits.max_tool_calls:
                 skipped = self._skip_step_for_tool_limit(task=task, step=step)
                 completed.append(skipped)
                 index += 1
@@ -686,7 +850,7 @@ class TaskRuntime:
         completed: Sequence[TaskStepRecord],
     ) -> str:
         self._check_runtime_budget(state)
-        if current.kind == "tool":
+        if _counts_toward_tool_limit(current):
             if state.tool_calls >= self._limits.max_tool_calls:
                 return _raise_tool_call_limit(self._limits.max_tool_calls)
             state.tool_calls += 1
@@ -855,6 +1019,9 @@ def _records_from_plan(task_id: str, plan: TaskPlan, *, start_index: int = 0) ->
     registry = default_tool_registry()
     for index, step in enumerate(plan.steps):
         descriptor = registry.descriptor_for(step.tool_name) if step.tool_name else None
+        risk: ToolRisk = "external_read" if step.kind == "web" else "read_only"
+        if descriptor is not None:
+            risk = descriptor.risk
         records.append(
             new_step_record(
                 task_id=task_id,
@@ -866,7 +1033,7 @@ def _records_from_plan(task_id: str, plan: TaskPlan, *, start_index: int = 0) ->
                 input=step.input,
                 depends_on=step.depends_on,
                 parallel_group=step.parallel_group,
-                risk=descriptor.risk if descriptor is not None else "read_only",
+                risk=risk,
                 requires_confirmation=descriptor.requires_confirmation if descriptor is not None else False,
             )
         )
@@ -935,6 +1102,14 @@ def _can_skip_failed_tool(step: TaskStepRecord) -> bool:
     return step.risk in {"read_only", "external_read", "network"}
 
 
+def _is_external_step(step: TaskStepRecord) -> bool:
+    return step.kind in {"tool", "rag", "web"}
+
+
+def _counts_toward_tool_limit(step: TaskStepRecord) -> bool:
+    return step.kind in {"tool", "rag", "web"}
+
+
 def _error_key(error: Exception) -> str:
     return f"{type(error).__name__}:{str(error)[:160]}"
 
@@ -948,6 +1123,18 @@ def _truncate_text(text: str, *, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[:max_chars]}\n\n[truncated after {max_chars} characters]"
+
+
+def _json_summary(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        text = str(value)
+    if len(text) <= _AUDIT_SUMMARY_LIMIT:
+        return text
+    return f"{text[: _AUDIT_SUMMARY_LIMIT - 14]}...[truncated]"
 
 
 def _rag_handler(config: AgentRuntimeConfig) -> ToolHandler:
@@ -968,6 +1155,15 @@ def _rag_handler(config: AgentRuntimeConfig) -> ToolHandler:
                     embed_query=embed_query,
                 ),
                 keyword_searcher=ElasticsearchKeywordStore(index=config.rag_es_index, url=config.rag_es_url),
+                chunk_hydrator=PostgresChunkTextHydrator(dsn=config.postgres_dsn) if config.postgres_dsn else None,
+                reranker=DashScopeTextReranker(
+                    api_key=config.dashscope_api_key or "",
+                    model=config.rag_rerank_model,
+                    endpoint=config.rag_rerank_url,
+                    timeout_seconds=config.rag_rerank_timeout_seconds,
+                )
+                if config.rag_rerank_model
+                else None,
             )
         query = str(input_data.get("query") or context.goal)
         top_k = _int_value(input_data.get("top_k"), default=6)
@@ -997,6 +1193,63 @@ def _memory_handler(config: AgentRuntimeConfig) -> ToolHandler:
     return handler
 
 
+def _web_search_handler(config: AgentRuntimeConfig) -> ToolHandler:
+    service = None
+
+    def handler(context: TaskExecutionContext, input_data: Mapping[str, object]) -> str:
+        nonlocal service
+        from deepagents.websearch import WebSearchService, blocked_query_reason, format_web_search_results  # noqa: PLC0415
+
+        if service is None:
+            service = WebSearchService(config)
+        query = str(input_data.get("query") or context.goal)
+        reason = blocked_query_reason(query)
+        if reason:
+            return reason
+        max_results = _int_value(input_data.get("max_results"), default=config.web_search_max_results)
+        return format_web_search_results(service.search(query, max_results=max_results), query=query)
+
+    return handler
+
+
+def _web_research_handler(config: AgentRuntimeConfig) -> ToolHandler:
+    service = None
+
+    def handler(context: TaskExecutionContext, input_data: Mapping[str, object]) -> str:
+        nonlocal service
+        from deepagents.websearch import WebSearchService, blocked_query_reason, format_web_research  # noqa: PLC0415
+
+        if service is None:
+            service = WebSearchService(config)
+        query = str(input_data.get("query") or context.goal)
+        reason = blocked_query_reason(query)
+        if reason:
+            return reason
+        max_results = _int_value(input_data.get("max_results"), default=config.web_search_max_results)
+        max_pages = _int_value(input_data.get("max_pages"), default=config.web_fetch_max_pages)
+        return format_web_research(service.research(query, max_results=max_results, max_pages=max_pages))
+
+    return handler
+
+
+def _web_fetch_page_handler(config: AgentRuntimeConfig) -> ToolHandler:
+    service = None
+
+    def handler(context: TaskExecutionContext, input_data: Mapping[str, object]) -> str:
+        del context
+        nonlocal service
+        from deepagents.websearch import WebSearchService, format_fetched_page  # noqa: PLC0415
+
+        if service is None:
+            service = WebSearchService(config)
+        url = str(input_data.get("url") or "")
+        if not url:
+            return "No URL was supplied."
+        return format_fetched_page(service.fetch_url(url))
+
+    return handler
+
+
 def _recent_messages(messages: Sequence[MessageRecord], *, limit: int = 12) -> tuple[dict[str, str], ...]:
     recent = messages[-limit:]
     return tuple({"role": message.role, "content": message.content[:1200]} for message in recent)
@@ -1021,6 +1274,7 @@ def _filter_descriptors(descriptors: Sequence[ToolDescriptor], *, disabled_tools
 def _context_payload(context: TaskContext) -> dict[str, object]:
     return {
         "goal": context.goal,
+        "current_goal": context.goal,
         "intent": context.intent,
         "recent_messages": list(context.recent_messages),
         "available_tools": list(context.available_tools),
@@ -1115,7 +1369,7 @@ def _list_value(value: object) -> list[object]:
 
 
 def _step_kind(value: object) -> TaskStepKind:
-    if value in {"think", "tool", "answer"}:
+    if value in {"think", "tool", "rag", "web", "process", "answer"}:
         return cast("TaskStepKind", value)
     return "think"
 

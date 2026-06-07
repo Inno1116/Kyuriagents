@@ -1,5 +1,6 @@
 -- Deep Agents RAG metadata schema for PostgreSQL 15+.
--- Vector data lives in Milvus and searchable text lives in Elasticsearch.
+-- Vector data lives in Milvus. PostgreSQL stores canonical chunk text while
+-- Elasticsearch keeps a searchable copy for keyword retrieval.
 -- PostgreSQL is the source of truth for users, tenants, knowledge bases,
 -- document lifecycle, chunk manifests, access rules, and offline ingestion jobs.
 
@@ -135,6 +136,7 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
     user_id VARCHAR(64) REFERENCES rag_users (user_id),
     chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
     content_hash CHAR(64) NOT NULL,
+    chunk_text TEXT NOT NULL DEFAULT '',
     source_type VARCHAR(32) NOT NULL,
     source_uri TEXT NOT NULL,
     title VARCHAR(512) NOT NULL DEFAULT '',
@@ -155,6 +157,9 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT uq_rag_chunks_doc_index UNIQUE (doc_version, chunk_index)
 );
+
+ALTER TABLE IF EXISTS rag_chunks
+    ADD COLUMN IF NOT EXISTS chunk_text TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_rag_chunks_scope
     ON rag_chunks (tenant_id, kb_id, is_active, visibility);
